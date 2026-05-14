@@ -1,0 +1,288 @@
+"""Generate the natural-language sentences that fill the
+'Fouling Conditions Executive Summary' table.
+
+The phrasing is **not** random — every one of the 12 rows uses a fixed
+sentence template taken verbatim from the source marine service report
+(``marine_service_report (2).pdf``). Only the **species** and the
+**thickness range** are filled in from AI analysis. This gives the report
+the exact look of a surveyor-written document while keeping the inferred
+data honest.
+
+Methodology
+-----------
+1. **Per-location templates** (see ``LOCATION_TEMPLATES``) hold the fixed
+   phrasing for each of the 12 standard locations the surveyor inspects.
+2. **Species** detected by the AI classifier are mapped to the casing
+   surveyors use in the template ("Slime", "barnacles", "Algae", …).
+   When two species are co-dominant, the sentence reads
+   *"fouled by Slime and barnacles"*.
+3. **Thickness** is **always** rendered as a millimetre **range** (e.g.
+   *"3-5mm"*) — never a single number like *"5mm"*. The range is picked
+   by mapping the AI's % area-covered estimate through a non-linear
+   bracket table, with a slightly thicker scale used for hard fouling
+   (barnacles, mussels).
+4. **Severity (A/B/C/D)** and **Cleaning (Yes/No)** are derived from the
+   coverage % using the same scale shown at the bottom of the source
+   template:  A=Light · B=Moderate · C=Heavy · D=Clean.
+"""
+from __future__ import annotations
+from typing import Dict, Any, Optional
+
+
+# --------------------------------------------------------------- templates
+# 12 location IDs match the rows of the source PDF's executive-summary
+# table. Each sentence is written exactly the way it appears in the
+# template; only {species} and {thickness} are injected.
+LOCATION_TEMPLATES: Dict[str, str] = {
+    "Bow": (
+        "The condition of plating of the bulbous bow area as visual "
+        "inspection is fouled by {species} with {thickness} of thickness."
+    ),
+    "PortSide": (
+        "The condition of side shell / vertical side at portside area as "
+        "visual inspection from forward to aft ward is fouled by {species} "
+        "with {thickness} of thickness."
+    ),
+    "Starboard": (
+        "The condition of side shell / vertical side at STB side area as "
+        "visual inspection from forward to aft ward is fouled by {species} "
+        "with {thickness} of thickness."
+    ),
+    "Flat_bottom": (
+        "The condition of flat bottom hull as visual inspection from "
+        "bottom forward to aft ward is fouled by {species} with "
+        "{thickness} of thickness."
+    ),
+    "DryDocking": (
+        "The condition of dry docking marks flat bottom hull as visual "
+        "inspection from bottom forward to aft ward is fouled by "
+        "{species} with {thickness} of thickness."
+    ),
+    "Bilege_keels": (
+        "The condition of bilge keel at portside and starboard side area "
+        "as visual inspection from fore tip to aft tip and flat bar is "
+        "fouled by {species} with {thickness} of thickness."
+    ),
+    "stren": (
+        "The condition of stern area as visual inspection is fouled by "
+        "{species} with {thickness} of thickness."
+    ),
+    "Sea_chest": (
+        "The condition of the sea chest gratings is fouled by {species} "
+        "with {thickness} of thickness."
+    ),
+    "Radder": (
+        "The condition of shell plating of rudder blade as visual "
+        "inspection from top to bottom is fouled by {species} with "
+        "{thickness} of thickness."
+    ),
+    "RudderPintle": (
+        "The condition of rudder pintle frame as visual inspection from "
+        "top to bottom is fouled by {species} with {thickness} of "
+        "thickness."
+    ),
+    "Rope": (
+        "The condition of rope guard as visual inspection is fouled by "
+        "{species} with {thickness} of thickness."
+    ),
+    "Propeller": (
+        "The propeller blades, as visual inspection on all blades are "
+        "fouled by {species} with {thickness} of thickness."
+    ),
+}
+
+
+# Per-location phrasing for the *clean* case (coverage < 10 %). Uses the
+# same opening structure as the fouled sentence so the table reads
+# consistently.
+CLEAN_TEMPLATES: Dict[str, str] = {
+    "Bow":          "The plating of the bulbous bow area as visual inspection appears clean with no significant fouling observed.",
+    "PortSide":     "The side shell / vertical side at portside area as visual inspection from forward to aft ward appears clean.",
+    "Starboard":    "The side shell / vertical side at STB side area as visual inspection from forward to aft ward appears clean.",
+    "Flat_bottom":  "The flat bottom hull as visual inspection from bottom forward to aft ward appears clean.",
+    "DryDocking":   "The dry docking marks on flat bottom hull as visual inspection appear clean.",
+    "Bilege_keels": "The bilge keel at portside and starboard side as visual inspection appears clean.",
+    "stren":        "The stern area as visual inspection appears clean with no significant fouling observed.",
+    "Sea_chest":    "The sea chest gratings as visual inspection appear clean with no significant fouling observed.",
+    "Radder":       "The shell plating of rudder blade as visual inspection from top to bottom appears clean.",
+    "RudderPintle": "The rudder pintle frame as visual inspection from top to bottom appears clean.",
+    "Rope":         "The rope guard as visual inspection appears clean with no significant fouling observed.",
+    "Propeller":    "The propeller blades, as visual inspection on all blades appear clean with no significant fouling observed.",
+}
+
+
+# ----------------------------------------------------------- species naming
+# Species classes from the AI model → label used in the report sentence.
+# Casing follows the source PDF exactly:
+#   - "Slime" stays capitalised (surveyor's standard term for biofilm /
+#     short algae growth — which is what our 'algae' class mostly catches)
+#   - "barnacles", "mussels", "Algae" (macroalgae) follow template casing
+SPECIES_LABEL = {
+    "algae":       "Slime",
+    "macroalgae":  "Algae",
+    "barnacles":   "Barnacles",
+    "mussels":     "Mussels",
+    "clean_paint": "clean paint",
+}
+
+# When the species is a *secondary* (`X and y`), the source PDF tends to
+# write the trailing species in lowercase (e.g. "Slime and barnacles").
+SPECIES_LABEL_SECONDARY = {
+    "algae":       "slime",
+    "macroalgae":  "algae",
+    "barnacles":   "barnacles",
+    "mussels":     "mussels",
+    "clean_paint": "clean paint",
+}
+
+# Whether the species is "hard" fouling (calcareous shellfish). Hard
+# fouling occupies a slightly thicker layer for the same coverage %, so
+# the thickness range is bumped up one bracket.
+_HARD_SPECIES = {"barnacles", "mussels"}
+
+
+# --------------------------------------------------------- thickness model
+# Both tables only ever return **ranges** (e.g. "3-5mm") — never a single
+# millimetre. Picking a range communicates the uncertainty inherent in
+# inferring layer thickness from visual coverage alone.
+_BRACKETS_SOFT = [
+    # (max coverage %,  range)
+    (10,  "0-1mm"),
+    (30,  "1-3mm"),
+    (50,  "2-4mm"),
+    (70,  "3-5mm"),
+    (85,  "5-7mm"),
+    (101, "5-10mm"),
+]
+_BRACKETS_HARD = [
+    (10,  "0-1mm"),
+    (30,  "1-3mm"),
+    (50,  "2-5mm"),
+    (70,  "3-6mm"),
+    (85,  "5-8mm"),
+    (101, "8-12mm"),
+]
+
+
+def thickness_range(pct: float, top_species: str) -> str:
+    """Map (coverage %, dominant species) → human-readable mm range.
+
+    Always returns a range. Never a single millimetre value.
+    """
+    brackets = _BRACKETS_HARD if top_species in _HARD_SPECIES else _BRACKETS_SOFT
+    for limit, label in brackets:
+        if pct < limit:
+            return label
+    return brackets[-1][1]
+
+
+def severity_letter(pct: float, top: str) -> str:
+    """A / B / C / D — same scale shown at the bottom of the template."""
+    if top == "clean_paint" or pct < 10:
+        return "D"          # Clean
+    if pct < 35:
+        return "A"          # Light
+    if pct < 65:
+        return "B"          # Moderate
+    return "C"              # Heavy
+
+
+def cleaning_recommended(pct: float, top: str) -> bool:
+    """Cleaning gets ticked 'Yes' when there is meaningful fouling."""
+    return top != "clean_paint" and pct >= 30
+
+
+def _species_phrase(primary: str, secondary: Optional[str]) -> str:
+    """Build the 'Slime' / 'Slime and barnacles' fragment."""
+    primary_lbl = SPECIES_LABEL.get(primary, primary.capitalize())
+    if not secondary:
+        return primary_lbl
+    sec_lbl = SPECIES_LABEL_SECONDARY.get(secondary, secondary.lower())
+    return f"{primary_lbl} and {sec_lbl}"
+
+
+# ------------------------------------------------- main entry points
+def narrative_for_location(template_id: str,
+                            meta: Dict[str, Any]) -> Dict[str, Any]:
+    """Generate the executive-summary row for a single location.
+
+    Args:
+        template_id: one of the keys in ``LOCATION_TEMPLATES`` (Bow,
+            PortSide, Starboard, …).
+        meta: per-region cluster meta from ``services.cluster`` —
+            must expose ``species_counts`` (dict[str, int]) and
+            ``avg_fouling`` (float % coverage).
+
+    Returns dict with:
+        sentence, primary_species, secondary_species,
+        thickness, pct, severity, cleaning, image_count
+    """
+    species_counts: Dict[str, int] = dict(meta.get("species_counts", {}))
+    pct: float                       = float(meta.get("avg_fouling", 0.0) or 0.0)
+    image_count                      = int(meta.get("count", 0) or 0)
+
+    # ignore clean_paint when reasoning about *fouling* species
+    fouling = {k: v for k, v in species_counts.items() if k != "clean_paint"}
+
+    # ---- "clean" branch ----------------------------------------
+    if not fouling or pct < 10:
+        return {
+            "sentence":          CLEAN_TEMPLATES.get(
+                template_id,
+                "This location appears clean with no significant fouling observed.",
+            ),
+            "primary_species":   "clean_paint",
+            "secondary_species": None,
+            "thickness":         "0-1mm",
+            "pct":               round(pct, 0),
+            "severity":          "D",
+            "cleaning":          False,
+            "image_count":       image_count,
+        }
+
+    # ---- "fouled" branch ---------------------------------------
+    sorted_sp = sorted(fouling.items(), key=lambda kv: -kv[1])
+    primary, primary_n = sorted_sp[0]
+    secondary: Optional[str] = None
+    if len(sorted_sp) > 1:
+        sec, sec_n = sorted_sp[1]
+        # a secondary species is only mentioned if it's a meaningful
+        # fraction of the dominant — otherwise the surveyor would skip it
+        if sec_n >= 0.25 * primary_n:
+            secondary = sec
+
+    thickness = thickness_range(pct, primary)
+    species_phrase = _species_phrase(primary, secondary)
+
+    tpl = LOCATION_TEMPLATES.get(
+        template_id,
+        # safe fall-back — same shape as the most generic row in the
+        # template ("Stern area")
+        "The condition of {location} as visual inspection is fouled by "
+        "{species} with {thickness} of thickness.",
+    )
+    sentence = tpl.format(
+        species=species_phrase,
+        thickness=thickness,
+        location=template_id.replace("_", " ").lower(),
+    )
+
+    return {
+        "sentence":          sentence,
+        "primary_species":   primary,
+        "secondary_species": secondary,
+        "thickness":         thickness,
+        "pct":               round(pct, 0),
+        "severity":          severity_letter(pct, primary),
+        "cleaning":          cleaning_recommended(pct, primary),
+        "image_count":       image_count,
+    }
+
+
+# ------------- legacy alias (kept for callers passing region_id) ----------
+# The 11 hull-region IDs from the AI model map 1:1 to the templates above
+# (most use the same key). The two synthetic locations — Starboard and
+# RudderPintle — must be requested via narrative_for_location() directly.
+def narrative_for_region(region_id: str,
+                          meta: Dict[str, Any]) -> Dict[str, Any]:
+    return narrative_for_location(region_id, meta)

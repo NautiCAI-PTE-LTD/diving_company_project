@@ -1,0 +1,105 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html, body, #root { height: 100%; }
+  body {
+    font-family: 'Inter', ui-sans-serif, system-ui, sans-serif;
+    background: #070d1a;
+    color: #e2e8f0;
+  }
+  ::selection { background: rgba(34, 211, 238, 0.35); color: #fff; }
+
+  /* Scrollbars */
+  *::-webkit-scrollbar { width: 10px; height: 10px; }
+  *::-webkit-scrollbar-track { background: transparent; }
+  *::-webkit-scrollbar-thumb {
+    background: linear-gradient(180deg, #1e355f, #0f1d3a);
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+  *::-webkit-scrollbar-thumb:hover { background: #2a4575; background-clip: padding-box; }
+}
+
+@layer components {
+  /* Glass surface used for panels and cards */
+  .glass {
+    @apply bg-white/[0.03] backdrop-blur-xl border border-white/10 shadow-card;
+  }
+  .glass-strong {
+    @apply bg-white/[0.05] backdrop-blur-2xl border border-white/10 shadow-card;
+  }
+
+  /* Buttons */
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5
+           text-sm font-semibold tracking-tight transition-all duration-200
+           disabled:opacity-50 disabled:cursor-not-allowed select-none;
+  }
+  .btn-primary {
+    @apply btn text-ink-950 bg-gradient-to-br from-brand-300 to-brand-500
+           hover:from-brand-200 hover:to-brand-400 shadow-glow;
+  }
+  .btn-ghost {
+    @apply btn text-slate-200 bg-white/5 hover:bg-white/10 border border-white/10;
+  }
+  .btn-outline {
+    @apply btn text-brand-200 border border-brand-400/40 hover:bg-brand-400/10;
+  }
+  .btn-danger {
+    @apply btn text-white bg-danger-500/90 hover:bg-danger-500;
+  }
+
+  /* Inputs */
+  .input {
+    @apply w-full rounded-xl bg-ink-900/70 border border-white/10
+           px-3.5 py-2.5 text-sm text-slate-100 placeholder:text-slate-500
+           focus:outline-none focus:ring-2 focus:ring-brand-400/40 focus:border-brand-400/40
+           transition;
+  }
+  .label {
+    @apply block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1.5;
+  }
+
+  /* Headings */
+  .h-display {
+    @apply font-display font-bold tracking-tight text-white;
+  }
+
+  /* Pill / badge */
+  .pill {
+    @apply inline-flex items-center gap-1.5 rounded-full px-2.5 py-1
+           text-[11px] font-semibold uppercase tracking-wider;
+  }
+  .pill-brand   { @apply pill bg-brand-400/15 text-brand-200 border border-brand-400/25; }
+  .pill-warn    { @apply pill bg-warning-500/15 text-amber-200 border border-warning-500/25; }
+  .pill-success { @apply pill bg-success-500/15 text-emerald-200 border border-success-500/25; }
+  .pill-mute    { @apply pill bg-white/5 text-slate-300 border border-white/10; }
+
+  /* Card hover lift */
+  .lift {
+    @apply transition-transform duration-300 hover:-translate-y-0.5;
+  }
+
+  /* Animated shimmer for loading lines */
+  .shimmer {
+    background: linear-gradient(
+      90deg,
+      rgba(255,255,255,0.04) 0%,
+      rgba(255,255,255,0.12) 50%,
+      rgba(255,255,255,0.04) 100%
+    );
+    background-size: 200% 100%;
+    @apply animate-shimmer rounded;
+  }
+}
+
+/* Subtle radial vignette behind app shell */
+.app-bg {
+  background:
+    radial-gradient(1200px 600px at 0% -10%, rgba(34,211,238,0.10) 0%, transparent 55%),
+    radial-gradient(900px 500px at 100% 0%, rgba(56,189,248,0.10) 0%, transparent 60%),
+    linear-gradient(180deg, #070d1a 0%, #0a1429 100%);
+}

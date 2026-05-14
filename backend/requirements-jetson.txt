@@ -1,0 +1,39 @@
+# ─────────────────────────────────────────────────────────────────────────
+# Jetson Orin Nano (JetPack 6.x) — pinned runtime dependencies.
+#
+# Differences vs requirements.txt:
+#   • torch / torchvision: install NVIDIA's aarch64 wheel manually (see
+#     deploy/jetson/README.md) — they're NOT on PyPI for aarch64+CUDA.
+#   • tensorflow: replaced by tf2onnx during model export only; not needed
+#     at runtime because we run the Before/After model through TensorRT.
+#   • Adds: onnx, onnxruntime, pycuda. TensorRT ships with JetPack itself.
+# ─────────────────────────────────────────────────────────────────────────
+
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+sqlalchemy>=2.0
+aiofiles>=23.0
+pydantic>=2.7
+pillow>=10.0
+opencv-python>=4.8
+numpy>=1.26
+timm>=1.0
+# NOTE: torch+torchvision are installed manually from the NVIDIA wheel.
+# easyocr requires torch but its setup.py only sees PyPI; install with --no-deps
+# after torch is present:  pip install --no-deps easyocr
+easyocr>=1.7
+reportlab>=4.0
+
+# Auth & multi-tenant support
+psycopg2-binary>=2.9
+passlib[bcrypt]>=1.7
+python-jose[cryptography]>=3.3
+email-validator>=2.0
+python-dotenv>=1.0
+
+# Edge inference
+onnx>=1.16
+onnxruntime>=1.18
+pycuda>=2024.1
+# tensorrt is provided by JetPack — don't pip install it on a Jetson.
