@@ -10,6 +10,11 @@ try:
 except Exception:
     pass
 
+# Jetson / offline edge: force local SQLite even if .env still has Supabase.
+# Usage on the edge box:  export NAUTICAI_USE_SQLITE=1
+if os.environ.get("NAUTICAI_USE_SQLITE", "").strip().lower() in ("1", "true", "yes"):
+    os.environ["DATABASE_URL"] = ""
+
 # ----- paths -------------------------------------------------------------
 BACKEND_DIR  = Path(__file__).resolve().parent
 PROJECT_ROOT = BACKEND_DIR.parent
