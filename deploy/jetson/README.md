@@ -192,7 +192,7 @@ If any backend says `"native"`, the engine file is missing — re-run step 3b.
 ## 6. Build and serve the frontend
 
 ```bash
-cd ~/motion_company_project   # fix path if needed: ~/diving_company_project
+cd ~/diving_company_project
 git pull origin main
 
 cd frontend
