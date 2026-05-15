@@ -22,12 +22,56 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
+import atexit
 import logging
 import os
+import threading
 
 import numpy as np
 
 log = logging.getLogger("nauticai.runtime")
+
+# PyCUDA / TensorRT ---------------------------------------------------------
+# Do NOT use ``pycuda.autoinit`` — it pushes a context and registers atexit
+# handlers that abort if CUDA was also touched from another thread (our model
+# warmup thread).  Share the device primary context with PyTorch instead.
+_TRT_CUDA_CTX: Optional[object] = None
+_TRT_CUDA_PUSHED = False
+_TRT_CUDA_LOCK = threading.Lock()
+
+
+def init_trt_cuda() -> None:
+    """One-time CUDA setup for TensorRT. Call from the main thread before any
+    background model loading (e.g. uvicorn startup)."""
+    global _TRT_CUDA_CTX, _TRT_CUDA_PUSHED
+    with _TRT_CUDA_LOCK:
+        if _TRT_CUDA_CTX is not None:
+            return
+        import pycuda.driver as cuda
+
+        cuda.init()
+        ctx = cuda.Device(0).retain_primary_context()
+        _TRT_CUDA_CTX = ctx
+        if cuda.Context.get_current() is None:
+            ctx.push()
+            _TRT_CUDA_PUSHED = True
+
+
+def _cleanup_trt_cuda() -> None:
+    global _TRT_CUDA_PUSHED
+    if not _TRT_CUDA_PUSHED or _TRT_CUDA_CTX is None:
+        return
+    try:
+        import pycuda.driver as cuda
+
+        if cuda.Context.get_current() is _TRT_CUDA_CTX:
+            _TRT_CUDA_CTX.pop()
+            _TRT_CUDA_PUSHED = False
+    except Exception:
+        pass
+
+
+atexit.register(_cleanup_trt_cuda)
 
 # Env knobs ------------------------------------------------------------------
 # NAUTICAI_BACKEND=auto|trt|onnx|native — force a specific backend (default auto)
@@ -107,8 +151,8 @@ class TensorRTEngine:
     """
 
     def __init__(self, engine_path: Path, batch: int = 1):
+        init_trt_cuda()
         import tensorrt as trt
-        import pycuda.autoinit  # noqa: F401  — initialise the CUDA context
         import pycuda.driver as cuda
 
         self._trt = trt

@@ -82,7 +82,6 @@ def _warmup_models() -> None:
     """
     _WARMUP_STATE["status"] = "warming"
     try:
-        _tune_torch()
         from .inference import region as r_, before_after as b_, species as s_
         # touch each model's lazy loader
         r_.class_names()
@@ -109,6 +108,14 @@ def _startup() -> None:
     init_db()
     log.info("NautiCAI backend ready · models dir = %s · device = %s",
               config.MODELS_DIR, config.DEVICE)
+    # CUDA context must exist on the main thread before TRT engines load in the
+    # warmup thread (pycuda + autoinit in a daemon thread aborts on exit).
+    _tune_torch()
+    try:
+        from .inference import _runtime as rt_
+        rt_.init_trt_cuda()
+    except Exception:
+        log.debug("TRT CUDA init skipped (no pycuda / CPU-only)", exc_info=True)
     # Warm models on a background thread so /docs / /health stay snappy.
     import threading
     threading.Thread(target=_warmup_models,
