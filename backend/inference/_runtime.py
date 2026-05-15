@@ -19,10 +19,10 @@ Lookup convention (relative to the original checkpoint path):
       → ONNX preference:     Models/Ship_classification_v2.onnx
 """
 from __future__ import annotations
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
-import atexit
+from typing import Iterator, Optional, Tuple
 import logging
 import os
 import threading
@@ -32,46 +32,41 @@ import numpy as np
 log = logging.getLogger("nauticai.runtime")
 
 # PyCUDA / TensorRT ---------------------------------------------------------
-# Do NOT use ``pycuda.autoinit`` — it pushes a context and registers atexit
-# handlers that abort if CUDA was also touched from another thread (our model
-# warmup thread).  Share the device primary context with PyTorch instead.
+# Do NOT use ``pycuda.autoinit`` — it registers atexit handlers that abort when
+# a daemon thread created the context.  Share the device primary context with
+# PyTorch and push/pop it per thread around each TRT section (warmup thread +
+# uvicorn request threads).
 _TRT_CUDA_CTX: Optional[object] = None
-_TRT_CUDA_PUSHED = False
 _TRT_CUDA_LOCK = threading.Lock()
 
 
 def init_trt_cuda() -> None:
-    """One-time CUDA setup for TensorRT. Call from the main thread before any
-    background model loading (e.g. uvicorn startup)."""
-    global _TRT_CUDA_CTX, _TRT_CUDA_PUSHED
+    """Retain the device primary CUDA context (compatible with PyTorch)."""
+    global _TRT_CUDA_CTX
     with _TRT_CUDA_LOCK:
         if _TRT_CUDA_CTX is not None:
             return
         import pycuda.driver as cuda
 
         cuda.init()
-        ctx = cuda.Device(0).retain_primary_context()
-        _TRT_CUDA_CTX = ctx
-        if cuda.Context.get_current() is None:
-            ctx.push()
-            _TRT_CUDA_PUSHED = True
+        _TRT_CUDA_CTX = cuda.Device(0).retain_primary_context()
 
 
-def _cleanup_trt_cuda() -> None:
-    global _TRT_CUDA_PUSHED
-    if not _TRT_CUDA_PUSHED or _TRT_CUDA_CTX is None:
-        return
+@contextmanager
+def trt_cuda_scope() -> Iterator[None]:
+    """Activate the shared primary context on the calling thread."""
+    init_trt_cuda()
+    import pycuda.driver as cuda
+
+    ctx = _TRT_CUDA_CTX
+    pushed = cuda.Context.get_current() != ctx
+    if pushed:
+        ctx.push()
     try:
-        import pycuda.driver as cuda
-
-        if cuda.Context.get_current() is _TRT_CUDA_CTX:
-            _TRT_CUDA_CTX.pop()
-            _TRT_CUDA_PUSHED = False
-    except Exception:
-        pass
-
-
-atexit.register(_cleanup_trt_cuda)
+        yield
+    finally:
+        if pushed:
+            ctx.pop()
 
 # Env knobs ------------------------------------------------------------------
 # NAUTICAI_BACKEND=auto|trt|onnx|native — force a specific backend (default auto)
@@ -151,79 +146,80 @@ class TensorRTEngine:
     """
 
     def __init__(self, engine_path: Path, batch: int = 1):
-        init_trt_cuda()
         import tensorrt as trt
         import pycuda.driver as cuda
 
         self._trt = trt
         self._cuda = cuda
         self._batch = batch
-        self._logger = trt.Logger(trt.Logger.WARNING)
-        runtime = trt.Runtime(self._logger)
-        with open(engine_path, "rb") as f:
-            self.engine = runtime.deserialize_cuda_engine(f.read())
-        self.context = self.engine.create_execution_context()
+        with trt_cuda_scope():
+            self._logger = trt.Logger(trt.Logger.WARNING)
+            runtime = trt.Runtime(self._logger)
+            with open(engine_path, "rb") as f:
+                self.engine = runtime.deserialize_cuda_engine(f.read())
+            self.context = self.engine.create_execution_context()
 
-        # Collect IO binding metadata.
-        self.input_name = None
-        self.output_name = None
-        for i in range(self.engine.num_io_tensors):
-            name = self.engine.get_tensor_name(i)
-            mode = self.engine.get_tensor_mode(name)
-            if mode == trt.TensorIOMode.INPUT:
-                self.input_name = name
-                self.input_dtype = trt.nptype(self.engine.get_tensor_dtype(name))
-            else:
-                self.output_name = name
-                self.output_dtype = trt.nptype(self.engine.get_tensor_dtype(name))
+            # Collect IO binding metadata.
+            self.input_name = None
+            self.output_name = None
+            for i in range(self.engine.num_io_tensors):
+                name = self.engine.get_tensor_name(i)
+                mode = self.engine.get_tensor_mode(name)
+                if mode == trt.TensorIOMode.INPUT:
+                    self.input_name = name
+                    self.input_dtype = trt.nptype(self.engine.get_tensor_dtype(name))
+                else:
+                    self.output_name = name
+                    self.output_dtype = trt.nptype(self.engine.get_tensor_dtype(name))
 
-        # Resolve dynamic shapes (batch=-1 from build_trt.py optimisation profile).
-        raw_in = tuple(self.engine.get_tensor_shape(self.input_name))
-        self.input_shape = _resolve_trt_shape(raw_in, batch=batch)
-        if not self.context.set_input_shape(self.input_name, self.input_shape):
-            raise RuntimeError(
-                f"TensorRT set_input_shape failed for {engine_path.name}: "
-                f"{raw_in} -> {self.input_shape}"
+            # Resolve dynamic shapes (batch=-1 from build_trt.py optimisation profile).
+            raw_in = tuple(self.engine.get_tensor_shape(self.input_name))
+            self.input_shape = _resolve_trt_shape(raw_in, batch=batch)
+            if not self.context.set_input_shape(self.input_name, self.input_shape):
+                raise RuntimeError(
+                    f"TensorRT set_input_shape failed for {engine_path.name}: "
+                    f"{raw_in} -> {self.input_shape}"
+                )
+            raw_out = tuple(self.engine.get_tensor_shape(self.output_name))
+            if any(d < 0 for d in raw_out):
+                raw_out = tuple(self.context.get_tensor_shape(self.output_name))
+            self.output_shape = _resolve_trt_shape(raw_out, batch=batch)
+
+            log.info(
+                "TRT engine %s · in=%s out=%s dtypes=%s/%s",
+                engine_path.name, self.input_shape, self.output_shape,
+                self.input_dtype, self.output_dtype,
             )
-        raw_out = tuple(self.engine.get_tensor_shape(self.output_name))
-        if any(d < 0 for d in raw_out):
-            raw_out = tuple(self.context.get_tensor_shape(self.output_name))
-        self.output_shape = _resolve_trt_shape(raw_out, batch=batch)
 
-        log.info(
-            "TRT engine %s · in=%s out=%s dtypes=%s/%s",
-            engine_path.name, self.input_shape, self.output_shape,
-            self.input_dtype, self.output_dtype,
-        )
-
-        # Allocate persistent device buffers
-        in_size = int(np.prod(self.input_shape)) * np.dtype(self.input_dtype).itemsize
-        out_size = int(np.prod(self.output_shape)) * np.dtype(self.output_dtype).itemsize
-        if in_size <= 0 or out_size <= 0:
-            raise RuntimeError(
-                f"Invalid TRT buffer size for {engine_path.name}: "
-                f"in={self.input_shape} out={self.output_shape}"
-            )
-        self._d_input = cuda.mem_alloc(in_size)
-        self._d_output = cuda.mem_alloc(out_size)
-        self.stream = cuda.Stream()
-        self.context.set_tensor_address(self.input_name, int(self._d_input))
-        self.context.set_tensor_address(self.output_name, int(self._d_output))
+            # Allocate persistent device buffers
+            in_size = int(np.prod(self.input_shape)) * np.dtype(self.input_dtype).itemsize
+            out_size = int(np.prod(self.output_shape)) * np.dtype(self.output_dtype).itemsize
+            if in_size <= 0 or out_size <= 0:
+                raise RuntimeError(
+                    f"Invalid TRT buffer size for {engine_path.name}: "
+                    f"in={self.input_shape} out={self.output_shape}"
+                )
+            self._d_input = cuda.mem_alloc(in_size)
+            self._d_output = cuda.mem_alloc(out_size)
+            self.stream = cuda.Stream()
+            self.context.set_tensor_address(self.input_name, int(self._d_input))
+            self.context.set_tensor_address(self.output_name, int(self._d_output))
 
     def infer(self, x: np.ndarray) -> np.ndarray:
         """Run a single inference. ``x`` must match ``input_shape`` / ``input_dtype``."""
-        cuda = self._cuda
-        x = np.ascontiguousarray(x.astype(self.input_dtype, copy=False))
-        if tuple(x.shape) != self.input_shape:
-            raise ValueError(
-                f"TRT input shape mismatch: got {x.shape}, expected {self.input_shape}"
-            )
-        out = np.empty(self.output_shape, dtype=self.output_dtype)
-        cuda.memcpy_htod_async(self._d_input, x, self.stream)
-        self.context.execute_async_v3(stream_handle=self.stream.handle)
-        cuda.memcpy_dtoh_async(out, self._d_output, self.stream)
-        self.stream.synchronize()
-        return out
+        with trt_cuda_scope():
+            cuda = self._cuda
+            x = np.ascontiguousarray(x.astype(self.input_dtype, copy=False))
+            if tuple(x.shape) != self.input_shape:
+                raise ValueError(
+                    f"TRT input shape mismatch: got {x.shape}, expected {self.input_shape}"
+                )
+            out = np.empty(self.output_shape, dtype=self.output_dtype)
+            cuda.memcpy_htod_async(self._d_input, x, self.stream)
+            self.context.execute_async_v3(stream_handle=self.stream.handle)
+            cuda.memcpy_dtoh_async(out, self._d_output, self.stream)
+            self.stream.synchronize()
+            return out
 
 
 # ---------------------------------------------------------------------------
