@@ -192,13 +192,21 @@ If any backend says `"native"`, the engine file is missing — re-run step 3b.
 ## 6. Build and serve the frontend
 
 ```bash
+cd ~/motion_company_project   # fix path if needed: ~/diving_company_project
+git pull origin main
+
 cd frontend
-# Install Node 20 if it isn't already there
+# Install Node 20 if it isn't already there (Vite 5 needs Node >= 18)
 curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
 sudo apt install -y nodejs
+node -v   # expect v20.x
 
-npm ci
-npm run build        # produces frontend/dist
+# Jetson npm 10.8 often rejects `npm ci` on nested picomatch — use the helper:
+chmod +x build-jetson.sh
+./build-jetson.sh        # produces frontend/dist
+
+# Or manually:
+#   rm -rf node_modules && npm install && npm run build
 ```
 
 Serve it however you prefer. The lightest option is to let nginx (already
