@@ -75,3 +75,6 @@ eval_*.csv
 2.jpg
 image.png
 marine_service_report*.pdf
+
+# Session-local handover docs (delete after deployment completes)
+JETSON_RESUME.md

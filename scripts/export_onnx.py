@@ -19,7 +19,13 @@ from __future__ import annotations
 from pathlib import Path
 import argparse
 import logging
+import os
 import sys
+
+# Force the native PyTorch / Keras path while exporting — otherwise the
+# runtime selector picks up any existing .onnx / .engine files and loads
+# them instead of the source checkpoint we want to re-export.
+os.environ["NAUTICAI_BACKEND"] = "native"
 
 # Allow running from anywhere — add project root to sys.path
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,17 +40,27 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(na
 
 
 def export_region(opset: int = 17) -> Path:
+    """Export the Swin-Tiny hull-region classifier.
+
+    NOTE: opset is overridden to **13** for this model. Swin-Tiny uses
+    LayerNorm, and ONNX opset 17+ emits a single ``LayerNormalization``
+    operator that TensorRT 8.5 (shipped with JetPack 5.x) does not
+    support natively. At opset 13 PyTorch decomposes LayerNorm into
+    primitive ops (ReduceMean, Sub, Mul, Sqrt, Div, Mul, Add) that any
+    TensorRT version handles. The accuracy is identical.
+    """
     import torch
     region_inf._load()  # populates _MODEL / _TFM
     model = region_inf._MODEL.cpu().eval()
     out_path = config.SHIP_REGION_CKPT.with_suffix(".onnx")
     dummy = torch.randn(1, 3, 224, 224, dtype=torch.float32)
-    log.info("Exporting region (Swin-Tiny) → %s", out_path)
+    region_opset = min(opset, 13)
+    log.info("Exporting region (Swin-Tiny) @ opset %d → %s", region_opset, out_path)
     torch.onnx.export(
         model, dummy, str(out_path),
         input_names=["input"], output_names=["logits"],
         dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}},
-        opset_version=opset,
+        opset_version=region_opset,
         do_constant_folding=True,
     )
     return out_path

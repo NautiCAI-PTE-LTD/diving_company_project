@@ -96,8 +96,22 @@ def main() -> int:
 
     if args.only:
         target = Path(args.only)
-        if not target.is_absolute():
-            target = MODELS_DIR / target
+        if target.is_absolute():
+            pass
+        elif target.is_file():
+            target = target.resolve()
+        else:
+            # User may pass "Models/foo.onnx" or just "foo.onnx"
+            rel = target
+            if rel.parts and rel.parts[0].lower() == "models":
+                rel = Path(*rel.parts[1:])
+            candidate = MODELS_DIR / rel
+            if not candidate.is_file():
+                candidate = MODELS_DIR / target.name
+            target = candidate
+        if not target.is_file():
+            log.error("ONNX file not found: %s", target)
+            return 1
         onnx_files = [target]
     else:
         onnx_files = sorted(MODELS_DIR.glob("*.onnx"))
