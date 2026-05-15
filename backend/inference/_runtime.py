@@ -88,26 +88,39 @@ def resolve(checkpoint: Path) -> RuntimeChoice:
 # ---------------------------------------------------------------------------
 # TensorRT helper
 # ---------------------------------------------------------------------------
+def _resolve_trt_shape(shape: tuple, batch: int = 1) -> tuple:
+    """Engines built with dynamic batch report ``-1`` in dim 0.  Fix before
+    allocating GPU memory (``np.prod`` on ``-1`` overflows mem_alloc)."""
+    out = []
+    for i, d in enumerate(shape):
+        if d == -1:
+            out.append(batch if i == 0 else 1)
+        else:
+            out.append(int(d))
+    return tuple(out)
+
+
 class TensorRTEngine:
     """Thin wrapper around a TensorRT engine for synchronous single-batch
     inference. Designed for the small classifiers used here — not optimised
     for streaming or batched throughput.
     """
 
-    def __init__(self, engine_path: Path):
+    def __init__(self, engine_path: Path, batch: int = 1):
         import tensorrt as trt
         import pycuda.autoinit  # noqa: F401  — initialise the CUDA context
         import pycuda.driver as cuda
 
         self._trt = trt
         self._cuda = cuda
+        self._batch = batch
         self._logger = trt.Logger(trt.Logger.WARNING)
         runtime = trt.Runtime(self._logger)
         with open(engine_path, "rb") as f:
             self.engine = runtime.deserialize_cuda_engine(f.read())
         self.context = self.engine.create_execution_context()
 
-        # Collect IO binding metadata so we don't allocate on every call.
+        # Collect IO binding metadata.
         self.input_name = None
         self.output_name = None
         for i in range(self.engine.num_io_tensors):
@@ -115,27 +128,52 @@ class TensorRTEngine:
             mode = self.engine.get_tensor_mode(name)
             if mode == trt.TensorIOMode.INPUT:
                 self.input_name = name
-                self.input_shape = tuple(self.engine.get_tensor_shape(name))
                 self.input_dtype = trt.nptype(self.engine.get_tensor_dtype(name))
             else:
                 self.output_name = name
-                self.output_shape = tuple(self.engine.get_tensor_shape(name))
                 self.output_dtype = trt.nptype(self.engine.get_tensor_dtype(name))
 
+        # Resolve dynamic shapes (batch=-1 from build_trt.py optimisation profile).
+        raw_in = tuple(self.engine.get_tensor_shape(self.input_name))
+        self.input_shape = _resolve_trt_shape(raw_in, batch=batch)
+        if not self.context.set_input_shape(self.input_name, self.input_shape):
+            raise RuntimeError(
+                f"TensorRT set_input_shape failed for {engine_path.name}: "
+                f"{raw_in} -> {self.input_shape}"
+            )
+        raw_out = tuple(self.engine.get_tensor_shape(self.output_name))
+        if any(d < 0 for d in raw_out):
+            raw_out = tuple(self.context.get_tensor_shape(self.output_name))
+        self.output_shape = _resolve_trt_shape(raw_out, batch=batch)
+
+        log.info(
+            "TRT engine %s · in=%s out=%s dtypes=%s/%s",
+            engine_path.name, self.input_shape, self.output_shape,
+            self.input_dtype, self.output_dtype,
+        )
+
         # Allocate persistent device buffers
-        in_size  = int(np.prod(self.input_shape)) * np.dtype(self.input_dtype).itemsize
+        in_size = int(np.prod(self.input_shape)) * np.dtype(self.input_dtype).itemsize
         out_size = int(np.prod(self.output_shape)) * np.dtype(self.output_dtype).itemsize
-        self._d_input  = cuda.mem_alloc(in_size)
+        if in_size <= 0 or out_size <= 0:
+            raise RuntimeError(
+                f"Invalid TRT buffer size for {engine_path.name}: "
+                f"in={self.input_shape} out={self.output_shape}"
+            )
+        self._d_input = cuda.mem_alloc(in_size)
         self._d_output = cuda.mem_alloc(out_size)
         self.stream = cuda.Stream()
-        self.context.set_tensor_address(self.input_name,  int(self._d_input))
+        self.context.set_tensor_address(self.input_name, int(self._d_input))
         self.context.set_tensor_address(self.output_name, int(self._d_output))
 
     def infer(self, x: np.ndarray) -> np.ndarray:
-        """Run a single inference. ``x`` must already be the right shape
-        and dtype (see ``input_shape`` / ``input_dtype``)."""
+        """Run a single inference. ``x`` must match ``input_shape`` / ``input_dtype``."""
         cuda = self._cuda
         x = np.ascontiguousarray(x.astype(self.input_dtype, copy=False))
+        if tuple(x.shape) != self.input_shape:
+            raise ValueError(
+                f"TRT input shape mismatch: got {x.shape}, expected {self.input_shape}"
+            )
         out = np.empty(self.output_shape, dtype=self.output_dtype)
         cuda.memcpy_htod_async(self._d_input, x, self.stream)
         self.context.execute_async_v3(stream_handle=self.stream.handle)
