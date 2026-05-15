@@ -38,6 +38,8 @@ log = logging.getLogger("nauticai.runtime")
 # uvicorn request threads).
 _TRT_CUDA_CTX: Optional[object] = None
 _TRT_CUDA_LOCK = threading.Lock()
+# Only one TRT execute at a time — parallel calls from analyze.py deadlock on Jetson.
+_TRT_INFER_LOCK = threading.Lock()
 
 
 def init_trt_cuda() -> None:
@@ -81,6 +83,16 @@ class RuntimeChoice:
     backend: str        # "trt" | "onnx" | "native"
     artefact: Optional[Path]
     reason: str
+
+
+def using_trt() -> bool:
+    """True if TensorRT engines are available for at least one vision model."""
+    from .. import config
+
+    for ckpt in (config.SHIP_REGION_CKPT, config.SPECIES_CKPT, config.BEFORE_AFTER_CKPT):
+        if resolve(ckpt).backend == "trt":
+            return True
+    return False
 
 
 def resolve(checkpoint: Path) -> RuntimeChoice:
@@ -207,6 +219,10 @@ class TensorRTEngine:
 
     def infer(self, x: np.ndarray) -> np.ndarray:
         """Run a single inference. ``x`` must match ``input_shape`` / ``input_dtype``."""
+        with _TRT_INFER_LOCK:
+            return self._infer_unlocked(x)
+
+    def _infer_unlocked(self, x: np.ndarray) -> np.ndarray:
         with trt_cuda_scope():
             cuda = self._cuda
             x = np.ascontiguousarray(x.astype(self.input_dtype, copy=False))

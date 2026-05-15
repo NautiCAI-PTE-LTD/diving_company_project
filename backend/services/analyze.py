@@ -10,6 +10,7 @@ from PIL import Image
 
 from .. import config
 from ..db import db_session, Image as ImageRow
+from ..inference import _runtime as inf_runtime
 from ..inference import region as region_model
 from ..inference import before_after as ba_model
 from ..inference import species as species_model
@@ -82,24 +83,30 @@ def analyze_file(path: Path, *, original_filename: str,
     pil = Image.open(path).convert("RGB")
     W, H = pil.size
 
-    # ----- Run all three models in parallel --------------------------
-    # Fire region, before/after and species concurrently. Wall-clock drops
-    # to ~max(model time) instead of sum(model time).  region.predict()
-    # holds an internal lock around lazy-load only, not around the forward
-    # pass, so this is safe to call from multiple threads.
-    if region_hint and region_hint in config.HULL_REGIONS:
-        region_future = None
-    else:
-        region_future = _POOL.submit(region_model.predict, pil)
-    stage_future   = _POOL.submit(ba_model.predict,    pil)
-    species_future = _POOL.submit(species_model.predict, pil)
+    # ----- Run the three vision models --------------------------------
+    # On CUDA + TensorRT (Jetson), running region / before_after / species
+    # in parallel deadlocks the GPU and hangs forever. Serialise there; keep
+    # the thread-pool parallelism for CPU / PyTorch-only workstations.
+    log.info("analyze %s · start (%dx%d)", image_id, W, H)
+    _serial = config.DEVICE == "cuda" or inf_runtime.using_trt()
 
     if region_hint and region_hint in config.HULL_REGIONS:
         region = {"id": region_hint,
                   "display": config.HULL_REGION_DISPLAY.get(region_hint, region_hint),
                   "confidence": 1.0, "distribution": []}
+    elif _serial:
+        region = region_model.predict(pil)
     else:
-        region = region_future.result()
+        region = _POOL.submit(region_model.predict, pil).result()
+
+    if _serial:
+        stage = ba_model.predict(pil)
+        species = species_model.predict(pil)
+    else:
+        stage_future = _POOL.submit(ba_model.predict, pil)
+        species_future = _POOL.submit(species_model.predict, pil)
+        stage = stage_future.result()
+        species = species_future.result()
 
     # ----- Ship-overview filter --------------------------------------
     # If this looks like a wide whole-ship photo (sky visible, low region
@@ -123,9 +130,9 @@ def analyze_file(path: Path, *, original_filename: str,
                 "distribution": [],
             }
 
-    stage   = stage_future.result()
-    species = species_future.result()
     severity = config.severity_from(species["fouling_pct"], species["top"])
+    log.info("analyze %s · done region=%s stage=%s species=%s",
+             image_id, region["id"], stage["id"], species["top"])
 
     # ----- Auto-OCR for overview shots --------------------------------
     # When the image is the whole-ship overview that the wizard uses as

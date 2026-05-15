@@ -430,6 +430,8 @@ async def analyze(image: UploadFile = File(...),
                   company: Company = Depends(auth_svc.get_current_company)):
     content = await image.read()
     image_id, dest = storage_svc.save_upload(content, image.filename or "upload.jpg")
+    log.info("analyze upload %s · %s · %d bytes", image_id,
+             image.filename or "upload.jpg", len(content))
     try:
         async with _ANALYZE_SEMAPHORE:
             # Run the (sync) model phase in a worker thread so we don't
