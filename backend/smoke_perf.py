@@ -68,9 +68,12 @@ def par():
     f3 = pool.submit(species.predict, img)
     f1.result(); f2.result(); f3.result()
 
-print("\nThree-model combo (representative of one /api/analyze call):")
+print("\nThree-model combo (one /api/analyze call):")
 _bench("seq 3 models",  seq, runs=3)
-_bench("par 3 models",  par, runs=3)
+if config.DEVICE == "cuda":
+    print("  (parallel 3-model skipped on CUDA — Jetson TRT must run serial)")
+else:
+    _bench("par 3 models",  par, runs=3)
 
 # OCR
 import tempfile, os
