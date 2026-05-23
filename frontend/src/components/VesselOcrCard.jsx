@@ -129,10 +129,10 @@ export default function VesselOcrCard({ onApply, defaultOpen = false }) {
                   </div>
                   <button
                     type="button"
-                    onClick={() => onApply?.(result.best_guess, result.image_id)}
+                    onClick={() => onApply?.(result.best_guess, result.image_id, result.best_confidence)}
                     className="btn-primary mt-3 w-full"
                   >
-                    <CheckCircle2 size={14} /> Use “{result.best_guess}” as vessel name
+                    <CheckCircle2 size={14} /> Use for report — name &amp; Photographic cover
                   </button>
                 </div>
               ) : (
@@ -148,7 +148,7 @@ export default function VesselOcrCard({ onApply, defaultOpen = false }) {
                     <button
                       key={i}
                       type="button"
-                      onClick={() => onApply?.(c.text, result.image_id)}
+                      onClick={() => onApply?.(c.text, result.image_id, c.confidence)}
                       className="flex w-full items-center justify-between rounded-lg bg-white/[0.04] px-3 py-1.5 text-left transition hover:bg-white/[0.08]"
                     >
                       <span className="font-mono text-sm text-white">{c.text}</span>

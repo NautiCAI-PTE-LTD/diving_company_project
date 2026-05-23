@@ -43,17 +43,35 @@ export default function Reports() {
     setBusyId(id)
     try {
       await generateReportPdf(id)
-      toast.success('PDF generated')
-      await openReportPdf(id)
+      toast.success('PDF generated — opening…')
+      try {
+        await openReportPdf(id)
+      } catch (openErr) {
+        toast.error(
+          `PDF was built but could not open: ${openErr?.message || openErr}. `
+          + 'Use Download on this row, or re-generate after setting the vessel cover on a new report.',
+        )
+      }
       await reload()
     } catch (e) {
-      toast.error(`PDF build failed: ${e?.response?.data?.detail || e?.message || e}`)
+      const msg = e?.response?.data?.detail || e?.message || String(e)
+      const hint = /network|ECONNREFUSED|timeout/i.test(msg)
+        ? ' — check backend on :8000 and wait for large PDFs to finish.'
+        : ''
+      toast.error(`PDF build failed: ${msg}${hint}`)
     } finally { setBusyId(null) }
   }
 
   const onOpen = async (r) => {
     try { await openReportPdf(r.id) }
-    catch (e) { toast.error(`Could not open PDF: ${e?.message || e}`) }
+    catch (e) {
+      const msg = e?.message || String(e)
+      toast.error(
+        msg.includes('not generated') || msg.includes('not found')
+          ? `${msg} — click the refresh icon to Generate PDF first.`
+          : `Could not open PDF: ${msg}`,
+      )
+    }
   }
   const onDownload = async (r) => {
     try { await downloadReportPdf(r.id, r.vesselName) }

@@ -1,0 +1,25 @@
+**/.git
+**/.venv
+**/venv
+**/__pycache__
+**/*.pyc
+**/.env
+**/.env.local
+frontend/node_modules
+frontend/dist
+backend/storage/**
+*.db
+*.sqlite
+Report_to_extract_images
+"Rerun model"
+*.zip
+eval_*.csv
+deploy/jetson
+.agent
+.cursor
+terminals
+*.md
+!backend/assets/report/README.md
+Models/*
+!Models/.gitkeep
+!Models/README.md

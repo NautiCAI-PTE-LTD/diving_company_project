@@ -44,6 +44,20 @@ python scripts/build_trt.py --fp16   # → produces *.engine consumed at runtime
 
 See `deploy/jetson/README.md` for the full Jetson deployment recipe.
 
+### GCP / cloud GPU (NVIDIA L4, A10, T4)
+
+Same ONNX → TensorRT pipeline on the **GPU VM** (not on a laptop):
+
+```bash
+./deploy/gcp-l4/setup_gpu_models.sh
+```
+
+Copy `deploy/gcp-l4/env.production.example` → `backend/.env` with `NAUTICAI_GPU_PROFILE=l4`.
+
+See **`deploy/gcp-l4/README.md`** for GCE + S3/CloudFront layout.
+
+Optional fast path without pre-built `.engine` files: set `NAUTICAI_ORT_TRT=1` so ONNX Runtime compiles TensorRT kernels on first run (cached under `Models/.ort_trt_cache/`).
+
 ## Why not Git LFS?
 
 Git LFS would work but burns GitHub's monthly LFS bandwidth quota every time

@@ -167,6 +167,22 @@ alter table public.reports
 create index if not exists reports_client_idx on public.reports (client_id);
 
 -- -----------------------------------------------------------------------------
+-- 5b. Vessels (company fleet — OCR matches names + aliases)
+-- -----------------------------------------------------------------------------
+create table if not exists public.vessels (
+    id          text primary key,
+    company_id  text not null references public.companies(id) on delete cascade,
+    name        text not null,
+    aliases     jsonb default '[]'::jsonb,
+    imo_number  text default '',
+    notes       text default '',
+    created_at  timestamptz default now(),
+    updated_at  timestamptz default now()
+);
+create index if not exists vessels_company_idx      on public.vessels (company_id);
+create index if not exists vessels_company_name_idx on public.vessels (company_id, name);
+
+-- -----------------------------------------------------------------------------
 -- (Optional) Row-Level Security
 -- -----------------------------------------------------------------------------
 -- The backend connects with the SERVICE ROLE so RLS isn't strictly required.

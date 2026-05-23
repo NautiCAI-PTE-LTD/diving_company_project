@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 import io
+import logging
+from concurrent.futures import ThreadPoolExecutor
 
 from PIL import Image as PILImage, ImageOps
 
@@ -31,10 +33,15 @@ from reportlab.platypus import (
     Image as RLImage, PageBreak,
 )
 from reportlab.platypus.flowables import HRFlowable
-from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.lib.utils import ImageReader
 
 from .. import config
+from . import storage as storage_svc
 from . import narrative as narrative_svc
+
+log = logging.getLogger("nauticai.pdf")
+from . import executive_summary as exec_summary_svc
 from . import vessel_diagram as diagram_svc
 
 # -------------------------- brand palette ----------------------------------
@@ -101,7 +108,79 @@ def _yn(value: Optional[bool]) -> str:
 
 
 _THUMB_CACHE: dict[tuple, bytes] = {}
-_THUMB_CACHE_LIMIT = 256       # ~10-20 MB worst case
+
+
+def sample_report_photos(items: list, max_n: int) -> list:
+    """Evenly sample photos for PDF grids (first + last + spread)."""
+    if max_n <= 0 or len(items) <= max_n:
+        return list(items)
+    if max_n == 1:
+        return [items[0]]
+    step = (len(items) - 1) / (max_n - 1)
+    out: list = []
+    seen: set[int] = set()
+    for i in range(max_n):
+        idx = min(len(items) - 1, round(i * step))
+        if idx in seen:
+            continue
+        seen.add(idx)
+        out.append(items[idx])
+    return out
+
+
+def cap_clusters_for_pdf(clusters: dict) -> dict:
+    """Limit before/after grids; executive tables still use full ``_meta`` counts."""
+    cap = config.PDF_MAX_PHOTOS_PER_STAGE
+    if cap <= 0:
+        return clusters
+    out: dict = {}
+    for region_id, bucket in clusters.items():
+        raw_b = bucket.get("before") or []
+        raw_a = bucket.get("after") or []
+        out[region_id] = {
+            **bucket,
+            "before": sample_report_photos(raw_b, cap),
+            "after": sample_report_photos(raw_a, cap),
+            "_meta": bucket.get("_meta") or {},
+            "_pdf_before_total": len(raw_b),
+            "_pdf_after_total": len(raw_a),
+        }
+    return out
+
+
+def _thumb_target_long(thumb_w: float, thumb_h: float) -> int:
+    target_long = max(int(thumb_w / mm * 6.0), int(thumb_h / mm * 6.0), 280)
+    return min(target_long, 960 if config.PDF_FAST else 1400)
+
+
+def prewarm_cluster_thumbnails(
+    clusters: dict,
+    *,
+    thumb_w: float = 52 * mm,
+    thumb_h: float = 38 * mm,
+    extra_paths: Optional[List[str | Path]] = None,
+) -> None:
+    """Decode thumbnails in parallel before ReportLab layout (big speed-up)."""
+    target = _thumb_target_long(thumb_w, thumb_h)
+    paths: set[str] = set()
+    for p in extra_paths or []:
+        if p and Path(p).exists():
+            paths.add(str(Path(p)))
+    for bucket in clusters.values():
+        for stage in ("before", "after"):
+            for im in bucket.get(stage) or []:
+                p = im.get("path") if isinstance(im, dict) else None
+                if p and Path(p).exists():
+                    paths.add(str(Path(p)))
+    if not paths:
+        return
+    workers = min(config.PDF_THUMB_WORKERS, len(paths))
+
+    def _job(path_str: str) -> None:
+        _make_thumb_bytes(Path(path_str), target)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(_job, paths))
 
 
 def _make_thumb_bytes(path: Path, target_long_px: int) -> Optional[bytes]:
@@ -124,32 +203,144 @@ def _make_thumb_bytes(path: Path, target_long_px: int) -> Optional[bytes]:
             im = ImageOps.exif_transpose(im).convert("RGB")
             im.thumbnail((target_long_px, target_long_px), PILImage.LANCZOS)
             buf = io.BytesIO()
-            im.save(buf, "JPEG", quality=80, optimize=True)
+            im.save(buf, "JPEG", quality=config.PDF_THUMB_QUALITY, optimize=True)
             data = buf.getvalue()
     except Exception:
         return None
     # cheap LRU-ish: drop arbitrary entries when we go over the limit
-    if len(_THUMB_CACHE) >= _THUMB_CACHE_LIMIT:
-        for k in list(_THUMB_CACHE.keys())[:32]:
+    limit = config.PDF_THUMB_CACHE_LIMIT
+    if len(_THUMB_CACHE) >= limit:
+        drop = max(32, len(_THUMB_CACHE) - limit + 64)
+        for k in list(_THUMB_CACHE.keys())[:drop]:
             _THUMB_CACHE.pop(k, None)
     _THUMB_CACHE[key] = data
     return data
 
 
-def _safe_image(path: str | Path, width: float, height: float) -> Optional[RLImage]:
+def _safe_image(path: str | Path, width: float, height: float, *, cover: bool = False) -> Optional[RLImage]:
     try:
-        p = Path(path)
-        # Pick a thumb size that roughly matches the rendered pixel count
-        # at A4 PDF resolution (~150 DPI). This keeps file size + embed
-        # cost low without visible quality loss in the PDF.
-        target_long = max(int(width / mm * 6.0), int(height / mm * 6.0), 320)
-        target_long = min(target_long, 1400)
+        p = storage_svc.resolve_image_path("", path) or Path(path)
+        if not p.exists():
+            return None
+        target_long = _thumb_target_long(width, height)
+        if cover:
+            target_long = max(target_long, 900)
+            target_long = min(target_long, 1400)
         data = _make_thumb_bytes(p, target_long)
         if data is None:
             return None
         return RLImage(io.BytesIO(data), width=width, height=height)
     except Exception:
         return None
+
+
+def _vessel_summary_rows(vessel: dict, vname: str, jno: str) -> list[tuple[str, str]]:
+    """Key fields shown beside the photographic cover image."""
+    client = vessel.get("client") or {}
+    client_name = (client.get("company") or client.get("name") or "").strip()
+    job_scope = (vessel.get("jobScope") or "").strip()
+    return [
+        ("Vessel Name", (vname or "—").upper()),
+        ("Job Order No.", jno or "—"),
+        ("Nature of Work", job_scope.title() if job_scope else "—"),
+        ("Date of Work", vessel.get("diveDate") or "—"),
+        ("Location", vessel.get("location") or "—"),
+        ("Vessel Type", vessel.get("vesselType") or "—"),
+        ("LOA (m)", str(vessel.get("loa") or "—")),
+        ("Draft (m)", str(vessel.get("draft") or "—")),
+        ("Client", client_name or "—"),
+    ]
+
+
+def _resolve_vessel_cover_path(vessel_image_path: Optional[str]) -> Optional[Path]:
+    if not vessel_image_path:
+        return None
+    return storage_svc.resolve_image_path("", vessel_image_path)
+
+
+def _draw_vessel_thumb_canvas(canvas, path: str | Path,
+                              x: float, y: float, max_w: float, max_h: float) -> bool:
+    """Draw a small vessel thumbnail on a page canvas (sub-bar, etc.)."""
+    p = storage_svc.resolve_image_path("", path) or Path(path)
+    if not p.exists():
+        return False
+    try:
+        target = int(max(max_w, max_h) * 3.5)
+        data = _make_thumb_bytes(p, target)
+        if not data:
+            return False
+        with PILImage.open(io.BytesIO(data)) as im:
+            iw, ih = im.size
+        scale = min(max_w / iw, max_h / ih)
+        dw, dh = iw * scale, ih * scale
+        canvas.drawImage(
+            ImageReader(io.BytesIO(data)), x, y, width=dw, height=dh,
+            preserveAspectRatio=True, anchor="sw", mask="auto",
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _photographic_cover_cell(resolved: Optional[Path], *, width: float, height: float):
+    """Left column: bordered vessel cover or placeholder."""
+    if resolved is not None:
+        vimg = _safe_image(resolved, width=width - 4 * mm, height=height - 4 * mm, cover=True)
+        if vimg is not None:
+            cell = Table([[vimg]], colWidths=(width,))
+            cell.setStyle(TableStyle([
+                ("LEFTPADDING", (0, 0), (-1, -1), 2),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+                ("TOPPADDING", (0, 0), (-1, -1), 2),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+                ("BOX", (0, 0), (-1, -1), 2, BRAND),
+                ("BACKGROUND", (0, 0), (-1, -1), colors.white),
+            ]))
+            return cell
+        log.warning("photographic cover unreadable: %s", resolved)
+    placeholder = Paragraph(
+        "<i>No vessel cover photograph available.<br/>"
+        "Upload a nameplate or bow photo on the Vessel step.</i>",
+        ParagraphStyle("PRPlaceholder", parent=SMALL, textColor=INK_500, alignment=TA_CENTER),
+    )
+    cell = Table([[placeholder]], colWidths=(width,), rowHeights=(height,))
+    cell.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), GREY_100),
+        ("BOX", (0, 0), (-1, -1), 1, INK_500),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    return cell
+
+
+def append_photographic_opener(
+    story: list,
+    *,
+    vessel: dict,
+    vessel_image_path: Optional[str],
+    vname: str,
+    jno: str,
+) -> None:
+    """Photographic Report opener: vessel image (left) + summary table (right)."""
+    story.append(_section_header("PHOTOGRAPHIC REPORT"))
+    resolved = _resolve_vessel_cover_path(vessel_image_path)
+    cover_h = 72 * mm
+    cover_w = 88 * mm
+    left = _photographic_cover_cell(resolved, width=cover_w, height=cover_h)
+    right = _kv_table(
+        _vessel_summary_rows(vessel, vname, jno),
+        col_widths=(42 * mm, 48 * mm),
+    )
+    opener = Table([[left, right]], colWidths=(cover_w, 94 * mm))
+    opener.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(opener)
+    story.append(Spacer(1, 10))
 
 
 def _kv_table(rows: list[tuple[str, str]], col_widths=(48 * mm, 110 * mm)) -> Table:
@@ -264,7 +455,7 @@ def _make_on_page(settings: dict, vessel_name: str, job_no: str, client_company:
         canvas.saveState()
         W, H = A4
         BANNER_H = 22 * mm
-        SUBBAR_H = 6 * mm   # vessel-name / job-no strip
+        SUBBAR_H = 6 * mm
 
         # ---- Main banner ----
         canvas.setFillColor(INK_900)
@@ -300,22 +491,19 @@ def _make_on_page(settings: dict, vessel_name: str, job_no: str, client_company:
         canvas.setFont("Helvetica-Bold", 8)
         canvas.drawRightString(W - 10 * mm, H - 14 * mm, title_line[:70])
 
-        # ---- Sub-bar: Vessel + Job ----
+        # ---- Sub-bar: vessel name + job no. (text only — no photo on every page) ----
+        y_sub = H - BANNER_H - SUBBAR_H
         canvas.setFillColor(GREY_100)
-        canvas.rect(0, H - BANNER_H - SUBBAR_H, W, SUBBAR_H, fill=1, stroke=0)
+        canvas.rect(0, y_sub, W, SUBBAR_H, fill=1, stroke=0)
         canvas.setFillColor(INK_900)
         canvas.setFont("Helvetica-Bold", 8.5)
-        canvas.drawString(12 * mm, H - BANNER_H - SUBBAR_H + 1.8 * mm,
-                          f"Vessel Name:  ")
+        canvas.drawString(12 * mm, y_sub + 1.8 * mm, "Vessel Name:  ")
         canvas.setFillColor(BRAND)
-        canvas.drawString(40 * mm, H - BANNER_H - SUBBAR_H + 1.8 * mm,
-                          (vessel_name or "—")[:40])
+        canvas.drawString(40 * mm, y_sub + 1.8 * mm, (vessel_name or "—")[:40])
         canvas.setFillColor(INK_900)
-        canvas.drawString(W - 80 * mm, H - BANNER_H - SUBBAR_H + 1.8 * mm,
-                          "Job No.:  ")
+        canvas.drawString(W - 80 * mm, y_sub + 1.8 * mm, "Job No.:  ")
         canvas.setFillColor(BRAND)
-        canvas.drawString(W - 62 * mm, H - BANNER_H - SUBBAR_H + 1.8 * mm,
-                          (job_no or "—")[:30])
+        canvas.drawString(W - 62 * mm, y_sub + 1.8 * mm, (job_no or "—")[:30])
         # thin separator line
         canvas.setStrokeColor(INK_500)
         canvas.setLineWidth(0.3)
@@ -618,147 +806,59 @@ def _summary_of_works_table(clusters: Dict[str, Any],
 
 
 # ============================ executive summary ============================
-# Standard 12 locations the marine-survey template prints — even when only
-# a subset of regions has images. Each row points to:
-#   - source region key:   which AI cluster supplies the species/coverage
-#   - template_id:         which sentence template to use (see narrative.py)
-# Two locations (Starboard, RudderPintle, DryDocking) share AI data with
-# their sibling region but use a different template so the row text reads
-# the way the surveyor's manual report does.
-_SUMMARY_LOCATIONS = [
-    # (display label,        source region,    template_id)
-    ("Bow",                   "Bow",            "Bow"),
-    ("Port Side",             "Verticle_Slide", "PortSide"),
-    ("Starboard Side",        "Verticle_Slide", "Starboard"),
-    ("Flat Bottom",           "Flat_bottom",    "Flat_bottom"),
-    ("Dry-docking Marks",     "Flat_bottom",    "DryDocking"),
-    ("Bilge Keels",           "Bilege_keels",   "Bilege_keels"),
-    ("Stern",                 "stren",          "stren"),
-    ("Sea Chest Gratings",    "Sea_chest",      "Sea_chest"),
-    ("Rudder/S",              "Radder",         "Radder"),
-    ("Rudder Pintle Frame",   "Radder",         "RudderPintle"),
-    ("Rope Guard",            "Rope",           "Rope"),
-    ("Propeller/S",           "Propeller",      "Propeller"),
-]
-
-# Species legend numbering matching the source PDF
-_SPECIES_LEGEND = [
-    ("0", "Clean",      colors.HexColor("#e5e7eb")),
-    ("1", "Barnacles",  colors.HexColor("#fde047")),  # highlighted in source
-    ("2", "Algae",      colors.HexColor("#86efac")),
-    ("3", "Slime",      colors.HexColor("#fde047")),  # highlighted in source
-    ("4", "Tubeworm",   colors.HexColor("#e5e7eb")),
-    ("5", "Mussels",    colors.HexColor("#e5e7eb")),
-    ("6", "Grass",      colors.HexColor("#e5e7eb")),
-    ("7", "Calcareous/Other", colors.HexColor("#e5e7eb")),
-]
-
-
-def _species_legend_table() -> Table:
-    """The strip above the exec summary explaining the fouling-class codes."""
-    row = []
-    for num, label, _bg in _SPECIES_LEGEND:
-        row.append(Paragraph(
-            f"<b>{num}-</b>{label}", SMALL))
-    t = Table([row], colWidths=[(170 / len(_SPECIES_LEGEND)) * mm] * len(_SPECIES_LEGEND))
-    style = [
-        ("BACKGROUND", (0, 0), (-1, -1), BRAND_L),
-        ("TEXTCOLOR",  (0, 0), (-1, -1), INK_900),
-        ("FONTNAME",   (0, 0), (-1, -1), "Helvetica"),
-        ("VALIGN",     (0, 0), (-1, -1), "MIDDLE"),
-        ("ALIGN",      (0, 0), (-1, -1), "CENTER"),
-        ("BOX",        (0, 0), (-1, -1), 0.4, INK_500),
-        ("INNERGRID",  (0, 0), (-1, -1), 0.25, INK_500),
-        ("TOPPADDING", (0, 0), (-1, -1), 3),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-    ]
-    # highlight the species we actually detect frequently (yellow tint)
-    for i, (_, _, bg) in enumerate(_SPECIES_LEGEND):
-        if bg != colors.HexColor("#e5e7eb"):
-            style.append(("BACKGROUND", (i, 0), (i, 0), bg))
-    t.setStyle(TableStyle(style))
-    return t
+def _species_legend_table(clusters: Dict[str, Any]) -> Table:
+    """Colour-coded legend — highlights species detected in this report."""
+    return exec_summary_svc.build_species_legend_table(
+        clusters, small_style=SMALL, default_band_bg=BRAND_L)
 
 
 def _executive_summary_table(clusters: Dict[str, Any]) -> Table:
-    """Renders the fixed 12-row 'Fouling Conditions Executive Summary' table
-    used in every marine service report, with Yes/No cleaning columns and a
-    Remarks column — exactly matching the template the user provided."""
-    # Compact, no-wrap header style — keeps "% Area", "Severity", "Yes",
-    # "No" on a single line so the header band stays one row high.
+    """12-row executive summary — sentences from AI per-region analysis."""
     HEAD_STYLE = ParagraphStyle(
         "TblHead", parent=BODY_B, fontSize=8.5, leading=10,
         textColor=colors.white, alignment=TA_CENTER,
     )
-    head = [
-        Paragraph("Location",            HEAD_STYLE),
-        Paragraph("Fouling Conditions Executive", HEAD_STYLE),
-        Paragraph("% Area",              HEAD_STYLE),
-        Paragraph("Severity",            HEAD_STYLE),
-        Paragraph("Yes",                 HEAD_STYLE),
-        Paragraph("No",                  HEAD_STYLE),
-        Paragraph("Remarks",             HEAD_STYLE),
-    ]
-    rows = [head]
-    for display_label, src_region, template_id in _SUMMARY_LOCATIONS:
-        bucket = clusters.get(src_region)
-        if not bucket:
-            # No images for this region — print a clean placeholder row
-            rows.append([
-                Paragraph(f"<b>{display_label}</b>", BODY),
-                Paragraph("<i>Not inspected / no images.</i>", SMALL),
-                Paragraph("—", BODY),
-                Paragraph("—", BODY),
-                Paragraph("", BODY),
-                Paragraph("", BODY),
-                Paragraph("", SMALL),
-            ])
+    return exec_summary_svc.build_executive_summary_table(
+        clusters,
+        body_style=BODY,
+        body_bold_style=BODY_B,
+        small_style=SMALL,
+        head_style=HEAD_STYLE,
+        header_bg=HEADER_FG,
+        row_alt=GREY_50,
+    )
+
+
+# ============================ source PDF photos ============================
+def _append_photos_from_source_pdf(story: list, source_pdf: Path) -> bool:
+    """Photographic annex from a legacy survey PDF (e.g. BW BIRCH reference)."""
+    from . import pdf_extract as extract_svc
+
+    manifest = extract_svc.extract_pdf_photos(source_pdf)
+    sections = extract_svc.merge_photo_sections(manifest)
+    if not sections:
+        return False
+
+    any_added = False
+    for block in sections:
+        title = (block.get("title") or "Photographs").replace("\ufffd", "–")
+        photos = [p for p in (block.get("photos") or []) if Path(p.get("path", "")).exists()]
+        if not photos and block.get("paths"):
+            photos = [{"path": p, "caption": title} for p in block["paths"] if Path(p).exists()]
+        if not photos:
             continue
+        any_added = True
+        story.append(Paragraph(title, BODY_B))
+        story.append(Paragraph(extract_svc.section_description(title), SMALL))
+        story.append(_photo_grid(photos, thumb_w=54 * mm, thumb_h=40 * mm, cols=3))
+        story.append(Spacer(1, 6))
+        story.append(HRFlowable(width="100%", thickness=0.3, color=GREY, spaceAfter=6))
 
-        meta = bucket["_meta"]
-        narr = narrative_svc.narrative_for_location(template_id, meta)
-
-        # Remarks column — only used when something noteworthy beyond the
-        # main sentence stands out (e.g. a secondary species worth listing).
-        # We keep this minimal so the row reads cleanly.
-        remarks = ""
-        if narr["secondary_species"]:
-            sec_label = narrative_svc.SPECIES_LABEL_SECONDARY.get(
-                narr["secondary_species"], narr["secondary_species"])
-            remarks = f"with {sec_label}"
-
-        cleaning = bool(narr["cleaning"])
-        rows.append([
-            Paragraph(f"<b>{display_label}</b>", BODY),
-            Paragraph(narr["sentence"], BODY),
-            Paragraph(f"{narr['pct']:.0f}", BODY),
-            Paragraph(narr["severity"], BODY),       # A / B / C / D
-            Paragraph("X" if cleaning else "", BODY),
-            Paragraph("" if cleaning else "X", BODY),
-            Paragraph(remarks, SMALL),
-        ])
-
-    # Column-width audit: 28+66+14+16+10+10+22 = 166 mm (≤ usable ~182mm)
-    t = Table(rows, colWidths=(28 * mm, 66 * mm, 14 * mm, 16 * mm,
-                                 10 * mm, 10 * mm, 22 * mm),
-              repeatRows=1)
-    # Cleaning Yes/No columns are visually grouped via a "Cleaning" caption
-    # in the header band — applied via a SPAN-style overlay row above.
-    t.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), HEADER_FG),
-        ("TEXTCOLOR",  (0, 0), (-1, 0), colors.white),
-        ("VALIGN",     (0, 0), (-1, -1), "MIDDLE"),
-        ("ALIGN",      (2, 1), (5, -1), "CENTER"),   # numeric / tick cells centred
-        ("ALIGN",      (0, 0), (-1, 0), "CENTER"),   # header row centred
-        ("LEFTPADDING",(0, 0), (-1, -1), 4),
-        ("RIGHTPADDING",(0, 0), (-1, -1), 4),
-        ("TOPPADDING", (0, 0), (-1, -1), 5),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-        ("BOX",        (0, 0), (-1, -1), 0.4, INK_500),
-        ("INNERGRID",  (0, 0), (-1, -1), 0.25, GREY),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, GREY_50]),
-    ]))
-    return t
+    if any_added:
+        n = len(manifest.get("images") or [])
+        story.append(Paragraph(
+            f"<i>Photographs from source survey document ({n} images).</i>", SMALL))
+    return any_added
 
 
 # ============================ MAIN BUILD ===================================
@@ -768,23 +868,55 @@ def build_pdf(
     clusters: dict,
     region_inspections: Optional[Dict[str, Any]] = None,
     vessel_image_path: Optional[str] = None,
+    source_pdf_path: Optional[str] = None,
     settings: Optional[dict] = None,
     report_id: str,
     created_at: Optional[datetime] = None,
+    **kwargs: Any,
 ) -> Path:
+    from .pdf_report_birch import build_pdf_if_birch
+
+    birch = build_pdf_if_birch(
+        out_path,
+        vessel=vessel,
+        clusters=clusters,
+        region_inspections=region_inspections,
+        vessel_image_path=vessel_image_path,
+        source_pdf_path=source_pdf_path,
+        settings=settings,
+        report_id=report_id,
+        created_at=created_at,
+        **kwargs,
+    )
+    if birch is not None:
+        return birch
+
     out_path = Path(out_path)
     created_at = created_at or datetime.utcnow()
     region_inspections = region_inspections or {}
     settings = settings or {}
+    clusters = cap_clusters_for_pdf(clusters)
+    prewarm_cluster_thumbnails(
+        clusters,
+        extra_paths=[vessel_image_path] if vessel_image_path else None,
+    )
 
     company_name = settings.get("company_name") or "Diving Company"
     vname = vessel.get("vesselName", "") or "—"
     jno   = vessel.get("jobNo", "") or "—"
 
+    settings = dict(settings or {})
+    settings["vessel_image_path"] = vessel_image_path
+    settings["vessel_extra"] = {
+        "diveDate": vessel.get("diveDate"),
+        "location": vessel.get("location"),
+        "vesselType": vessel.get("vesselType"),
+        "jobScope": vessel.get("jobScope"),
+    }
     doc = SimpleDocTemplate(
         str(out_path), pagesize=A4,
         leftMargin=14 * mm, rightMargin=14 * mm,
-        topMargin=34 * mm, bottomMargin=14 * mm,    # extra top room for the new subbar
+        topMargin=34 * mm, bottomMargin=14 * mm,
         title=f"{company_name} · Marine Service Report · {vname}",
         author=company_name,
     )
@@ -962,18 +1094,13 @@ def build_pdf(
             story.append(Paragraph(
                 f"<b>Team Remarks:</b> {c['remarks']}", BODY))
 
-        # break to a new page between crews so each crew gets its own section
-        if idx < len(crews):
-            story.append(PageBreak())
-
     # ============================================================ Per-region pages ====
-    story.append(PageBreak())
     story.append(_section_header("INSPECTION FINDINGS — PER HULL REGION"))
 
     if clusters:
         for region_id, bucket in clusters.items():
-            findings  = region_inspections.get(region_id, {}) if region_inspections else {}
-            narr      = narrative_svc.narrative_for_region(region_id, bucket["_meta"])
+            findings = region_inspections.get(region_id, {}) if region_inspections else {}
+            narr = narrative_svc.narrative_for_region(region_id, bucket["_meta"])
             story.extend(_region_inspection_section(region_id, bucket, findings, narr))
     else:
         story.append(Paragraph(
@@ -1010,8 +1137,10 @@ def build_pdf(
     # ============================================================ Executive Summary ====
     story.append(PageBreak())
     story.append(_section_header("FOULING CONDITIONS EXECUTIVE SUMMARY"))
-    # Species-code legend strip (0-Clean, 1-Barnacles, …)
-    story.append(_species_legend_table())
+    story.append(exec_summary_svc.build_executive_header(
+        vessel.get("vesselName", ""), vessel.get("jobNo", ""), body_style=BODY))
+    story.append(Spacer(1, 3))
+    story.append(_species_legend_table(clusters))
     story.append(Spacer(1, 4))
     story.append(_executive_summary_table(clusters))
     story.append(Spacer(1, 4))
@@ -1025,67 +1154,10 @@ def build_pdf(
 
     # ============================================================ Photographic Report ====
     story.append(PageBreak())
-
-    # --- Vessel identification opener (matches the source template):
-    #     left = large bordered photo, right = sidebar with PHOTOGRAPHIC
-    #     REPORT title, vessel name (red), nature of work, date, job no.
-    if vessel_image_path and Path(vessel_image_path).exists():
-        vimg = _safe_image(vessel_image_path, width=110 * mm, height=80 * mm)
-        if vimg is None:
-            # fall back to plain section header if the file is missing
-            story.append(_section_header("PHOTOGRAPHIC REPORT"))
-        else:
-            # Sidebar text styles (cyan title + red vessel name)
-            S_TITLE = ParagraphStyle("PRTitle", parent=BODY,
-                fontName="Helvetica-Bold", fontSize=18, leading=22,
-                textColor=BRAND_D, alignment=TA_CENTER, spaceAfter=6)
-            S_LBL = ParagraphStyle("PRLbl", parent=BODY,
-                fontName="Helvetica-Bold", fontSize=11, leading=14,
-                textColor=BRAND_D, alignment=TA_CENTER, spaceBefore=8)
-            S_VESSEL = ParagraphStyle("PRVes", parent=BODY,
-                fontName="Helvetica-Bold", fontSize=14, leading=18,
-                textColor=colors.HexColor("#dc2626"),
-                alignment=TA_CENTER, spaceAfter=4)
-            S_VAL = ParagraphStyle("PRVal", parent=BODY,
-                fontSize=10, leading=13,
-                textColor=INK_700, alignment=TA_CENTER, spaceAfter=2)
-
-            # Wrap the photo in a thin blue frame so it visually matches
-            # the source template's bordered look.
-            bordered_img = Table([[vimg]], colWidths=(112 * mm,))
-            bordered_img.setStyle(TableStyle([
-                ("LEFTPADDING",   (0, 0), (-1, -1), 2),
-                ("RIGHTPADDING",  (0, 0), (-1, -1), 2),
-                ("TOPPADDING",    (0, 0), (-1, -1), 2),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-                ("BOX",           (0, 0), (-1, -1), 3, BRAND),
-                ("INNERGRID",     (0, 0), (-1, -1), 0, colors.white),
-                ("BACKGROUND",    (0, 0), (-1, -1), colors.white),
-            ]))
-
-            sidebar = [
-                Paragraph("PHOTOGRAPHIC REPORT", S_TITLE),
-                Paragraph("Vessel Name", S_LBL),
-                Paragraph(vname.upper() or "—", S_VESSEL),
-                Paragraph("Nature of Work", S_LBL),
-                Paragraph(job_scope.title() if job_scope else "—", S_VAL),
-                Paragraph("Date", S_LBL),
-                Paragraph(vessel.get("diveDate") or "—", S_VAL),
-                Paragraph("Job Order No.", S_LBL),
-                Paragraph(jno or "—", S_VAL),
-            ]
-
-            opener = Table([[bordered_img, sidebar]],
-                            colWidths=(115 * mm, 65 * mm))
-            opener.setStyle(TableStyle([
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 2),
-                ("RIGHTPADDING",(0, 0), (-1, -1), 2),
-            ]))
-            story.append(opener)
-            story.append(Spacer(1, 10))
-    else:
-        story.append(_section_header("PHOTOGRAPHIC REPORT"))
+    append_photographic_opener(
+        story, vessel=vessel, vessel_image_path=vessel_image_path,
+        vname=vname, jno=jno,
+    )
 
     # --- Per-region Before / After grids ---
     for region_id, bucket in clusters.items():
@@ -1094,6 +1166,7 @@ def build_pdf(
         before_imgs = bucket.get("before", [])
         after_imgs  = bucket.get("after",  [])
 
+        story.append(PageBreak())
         story.append(Paragraph(region_disp, H1))
         # Side-view vessel diagram with red circle on this region
         diagram = diagram_svc.diagram_for_region(
@@ -1102,10 +1175,18 @@ def build_pdf(
         if diagram is not None:
             story.append(diagram)
             story.append(Spacer(1, 4))
-        story.append(Paragraph(f"&#9744; Before Cleaning &nbsp;·&nbsp; {len(before_imgs)} photo(s)", H2))
+        total_b = bucket.get("_pdf_before_total", len(before_imgs))
+        b_label = f"&#9744; Before Cleaning &nbsp;·&nbsp; {total_b} photo(s)"
+        if len(before_imgs) < total_b:
+            b_label += f" (showing {len(before_imgs)})"
+        story.append(Paragraph(b_label, H2))
         story.append(_photo_grid(before_imgs, thumb_w=52 * mm, thumb_h=38 * mm, cols=3))
         story.append(Spacer(1, 3))
-        story.append(Paragraph(f"&#9744; After Cleaning &nbsp;·&nbsp; {len(after_imgs)} photo(s)", H2))
+        total_a = bucket.get("_pdf_after_total", len(after_imgs))
+        a_label = f"&#9744; After Cleaning &nbsp;·&nbsp; {total_a} photo(s)"
+        if len(after_imgs) < total_a:
+            a_label += f" (showing {len(after_imgs)})"
+        story.append(Paragraph(a_label, H2))
         story.append(_photo_grid(after_imgs, thumb_w=52 * mm, thumb_h=38 * mm, cols=3))
         story.append(HRFlowable(width="100%", thickness=0.5, color=GREY,
                                 spaceBefore=4, spaceAfter=4))

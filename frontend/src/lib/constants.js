@@ -1,7 +1,5 @@
-// Class names taken DIRECTLY from the trained model bundles in /Models.
-// Spelling is preserved (Bilege_keels, Radder, Verticle_Slide, stren) because
-// the integer label index inside the .pth checkpoint is bound to these strings.
-// The displayLabel field is what we render to the user.
+// Class names mirror the trained species bundle (sync via GET /api/config when loaded).
+// Legacy 5-class ids kept for backward compatibility.
 
 export const HULL_REGIONS = [
   { id: 'Bow',                 displayLabel: 'Bow',                 icon: 'Anchor'      },
@@ -19,22 +17,27 @@ export const HULL_REGIONS = [
 
 export const SPECIES = [
   { id: 'clean_paint', displayLabel: 'Clean Paint', color: '#10b981' },
-  { id: 'algae',       displayLabel: 'Algae',       color: '#84cc16' },
-  { id: 'macroalgae',  displayLabel: 'Macroalgae',  color: '#22c55e' },
+  { id: 'slime',       displayLabel: 'Slime',       color: '#fed7aa' },
+  { id: 'algae',       displayLabel: 'Algae',       color: '#86efac' },
+  { id: 'grass',       displayLabel: 'Grass',       color: '#bbf7d0' },
+  { id: 'macroalgae',  displayLabel: 'Grass / Algae', color: '#86efac' },
   { id: 'barnacles',   displayLabel: 'Barnacles',   color: '#f59e0b' },
   { id: 'mussels',     displayLabel: 'Mussels',     color: '#ef4444' },
+  { id: 'tubeworms',   displayLabel: 'Tube worms',  color: '#a78bfa' },
+  { id: 'goosenecks',  displayLabel: 'Goosenecks',  color: '#d97706' },
+  { id: 'calcareous',  displayLabel: 'Calcareous',  color: '#78716c' },
+  { id: 'mixed_fouling', displayLabel: 'Mixed',     color: '#6b7280' },
+  { id: 'vessel_cover', displayLabel: 'Vessel cover', color: '#94a3b8' },
 ]
 
-// Stage = before / after cleaning (binary head from Before_and_after.h5)
 export const STAGES = [
   { id: 'before', displayLabel: 'Before Cleaning', color: '#f97316' },
   { id: 'after',  displayLabel: 'After Cleaning',  color: '#22d3ee' },
+  { id: 'not_hull', displayLabel: 'Cover / Not hull', color: '#94a3b8' },
 ]
 
-// Rubert roughness comparator scale used in the report
 export const ROUGHNESS_SCALE = ['A', 'B', 'C', 'D', 'E', 'F']
 
-// Severity matches the PDF's "Severity: (A) Light (B) Moderate (C) Heavy (D) Clean"
 export const SEVERITY = [
   { id: 'A', label: 'Light',    color: '#10b981' },
   { id: 'B', label: 'Moderate', color: '#f59e0b' },

@@ -8,6 +8,7 @@ import toast from 'react-hot-toast'
 import ImageDropzone from '../components/ImageDropzone'
 import { HULL_REGIONS } from '../lib/constants'
 import { analyzeImage, analyzeVideo, isVideoFile, fetchImageObjectUrl } from '../lib/api'
+import { isCoverOnlyResult, ocrCandidateScore, pickBestVesselOcr } from '../lib/vesselCover'
 
 const uid = () => crypto.randomUUID()
 
@@ -22,6 +23,7 @@ const uid = () => crypto.randomUUID()
 export default function UploadImages() {
   const [items, setItems] = useState([])
   const [busy, setBusy] = useState(false)
+  const [vesselCover, setVesselCover] = useState(null) // { name, imageId, url, fileName }
 
   // -------- adding files (handles drop + folder pick + paste) --------
   const addFiles = (files) => {
@@ -63,16 +65,68 @@ export default function UploadImages() {
         )
         data.frames = data.frames.map((f, idx) => ({ ...f, thumb_url: thumbs[idx] }))
         const counts = {}
-        for (const f of data.frames) counts[f.region.id] = (counts[f.region.id] || 0) + 1
+        for (const f of data.frames) {
+          if (!isCoverOnlyResult(f)) counts[f.region.id] = (counts[f.region.id] || 0) + 1
+        }
+        for (const f of data.frames) {
+          if (!isCoverOnlyResult(f) || !f.vessel_ocr?.best_guess) continue
+          const prev = vesselCover
+            ? {
+              confidence: vesselCover.confidence || 0,
+              guess: vesselCover.name || '',
+              imageId: vesselCover.imageId || '',
+              score: vesselCover.score || ocrCandidateScore(vesselCover.name, vesselCover.confidence),
+            }
+            : {}
+          const best = pickBestVesselOcr([f], prev)
+          if (best.guess) {
+            setVesselCover((vc) => (!vc || best.score > (vc.score || 0))
+              ? {
+                name: best.guess,
+                imageId: best.imageId,
+                fileName: it.name,
+                url: it.url,
+                confidence: best.confidence,
+                score: best.score,
+              }
+              : vc)
+          }
+        }
         const region = Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0] || null
         setItems((p) => p.map((i) =>
           i.id === id ? { ...i, status: 'done', result: data, region, progress: 1 } : i,
         ))
       } else {
         const result = await analyzeImage(it.file)
-        setItems((p) => p.map((i) =>
-          i.id === id ? { ...i, status: 'done', result, region: result.region.id, progress: 1 } : i,
-        ))
+        if (isCoverOnlyResult(result)) {
+          const vo = result.vessel_ocr
+          const prev = vesselCover
+            ? {
+              confidence: vesselCover.confidence || 0,
+              guess: vesselCover.name || '',
+              imageId: vesselCover.imageId || '',
+              score: vesselCover.score || ocrCandidateScore(vesselCover.name, vesselCover.confidence),
+            }
+            : {}
+          const best = pickBestVesselOcr([result], prev)
+          if (best.guess && (!vesselCover || best.score > (vesselCover.score || 0))) {
+            setVesselCover({
+              name: best.guess,
+              imageId: best.imageId || result.image_id,
+              url: it.url,
+              fileName: it.name,
+              confidence: best.confidence,
+              score: best.score,
+            })
+          }
+          setItems((p) => p.map((i) =>
+            i.id === id ? { ...i, status: 'done', result, region: 'vessel_cover', progress: 1 } : i,
+          ))
+        } else {
+          setItems((p) => p.map((i) =>
+            i.id === id ? { ...i, status: 'done', result, region: result.region.id, progress: 1 } : i,
+          ))
+        }
       }
     } catch (err) {
       const msg = err?.response?.data?.detail || err?.message || 'Analysis failed'
@@ -115,6 +169,7 @@ export default function UploadImages() {
     const cards = []
     for (const it of items) {
       if (it.kind === 'image') {
+        if (it.region === 'vessel_cover' || isCoverOnlyResult(it.result)) continue
         cards.push({
           kind: 'image',
           id: it.id, parentId: it.id,
@@ -123,6 +178,7 @@ export default function UploadImages() {
         })
       } else if (it.result?.frames) {
         for (const f of it.result.frames) {
+          if (isCoverOnlyResult(f)) continue
           cards.push({
             kind: 'frame',
             id: f.image_id, parentId: it.id,
@@ -171,6 +227,20 @@ export default function UploadImages() {
       </header>
 
       <ImageDropzone onFiles={addFiles} />
+
+      {vesselCover?.name && (
+        <section className="glass rounded-2xl p-4 flex flex-wrap items-center gap-3 border border-emerald-500/20">
+          <ScanSearch size={18} className="text-emerald-400 shrink-0" />
+          <div>
+            <div className="text-xs text-slate-400">Vessel name (Photographic Report cover)</div>
+            <div className="font-display font-semibold text-white">{vesselCover.name}</div>
+            <div className="text-[11px] text-slate-500">{vesselCover.fileName}</div>
+          </div>
+          {vesselCover.url && (
+            <img src={vesselCover.url} alt="" className="h-16 w-24 object-cover rounded-lg ml-auto" />
+          )}
+        </section>
+      )}
 
       {/* video status panel */}
       <AnimatePresence>

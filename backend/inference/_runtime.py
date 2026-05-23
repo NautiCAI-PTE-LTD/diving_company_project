@@ -76,6 +76,65 @@ _FORCE = os.environ.get("NAUTICAI_BACKEND", "auto").strip().lower()
 # NAUTICAI_TRT_FP16=1 — build new engines in FP16 (only relevant if engine
 # generation is triggered at runtime; usually we ship a pre-built engine).
 _TRT_FP16 = os.environ.get("NAUTICAI_TRT_FP16", "1").strip() not in ("0", "false", "no")
+# Set NAUTICAI_ORT_TRT=1 to let ONNX Runtime try TensorRT EP (Jetson / L4 / A10).
+_ORT_USE_TRT = os.environ.get("NAUTICAI_ORT_TRT", "0").strip() in ("1", "true", "yes")
+_GPU_PROFILE = os.environ.get("NAUTICAI_GPU_PROFILE", "").strip().lower()
+_ORT_CUDA_OK: Optional[bool] = None
+
+
+def _ort_cuda_available() -> bool:
+    """Probe once whether ONNX Runtime can actually run on CUDA (cuDNN in PATH)."""
+    global _ORT_CUDA_OK
+    if _ORT_CUDA_OK is not None:
+        return _ORT_CUDA_OK
+    try:
+        import onnxruntime as ort
+        if "CUDAExecutionProvider" not in ort.get_available_providers():
+            _ORT_CUDA_OK = False
+            return False
+        from .. import config
+        probe = config.SPECIES_CKPT.with_suffix(".onnx")
+        if not probe.exists():
+            _ORT_CUDA_OK = False
+            return False
+        so = ort.SessionOptions()
+        so.log_severity_level = 4
+        sess = ort.InferenceSession(
+            str(probe), so,
+            providers=[("CUDAExecutionProvider", {"device_id": 0}), "CPUExecutionProvider"],
+        )
+        provs = sess.get_providers()
+        _ORT_CUDA_OK = bool(provs) and provs[0] == "CUDAExecutionProvider"
+    except Exception:
+        _ORT_CUDA_OK = False
+    log.info("ONNX Runtime CUDA EP available=%s", _ORT_CUDA_OK)
+    return _ORT_CUDA_OK
+
+
+def _prefer_onnx_in_auto(checkpoint: Path) -> bool:
+    """Per-checkpoint auto pick: ONNX vs native PyTorch/Keras on this machine."""
+    from .. import config
+
+    if not checkpoint.with_suffix(".onnx").exists():
+        return False
+    suffix = checkpoint.suffix.lower()
+    if suffix == ".keras":
+        return True
+    if config.DEVICE == "cuda" and _ort_cuda_available():
+        # Cloud L4 / A10: ONNX CUDA (or TRT EP) is the production path.
+        return True
+    if suffix == ".pt" and config.DEVICE == "cuda" and not _ort_cuda_available():
+        return True
+    if suffix == ".pth" and config.DEVICE == "cuda" and not _ort_cuda_available():
+        return False
+    return _ort_cuda_available()
+
+
+def _use_ort_tensorrt_ep() -> bool:
+    """Only when NAUTICAI_ORT_TRT=1. L4 speed comes from pre-built ``.engine``
+    files (``build_trt.py``), not ORT's TensorRT EP — enabling the EP without
+    system TensorRT libraries forces a slow CPU fallback."""
+    return _ORT_USE_TRT
 
 
 @dataclass
@@ -129,6 +188,11 @@ def resolve(checkpoint: Path) -> RuntimeChoice:
     if _FORCE in ("auto", "onnx") and onnx_path.exists():
         try:
             import onnxruntime  # noqa: F401
+            if _FORCE == "auto" and not _prefer_onnx_in_auto(checkpoint):
+                return RuntimeChoice(
+                    "native", None,
+                    f"auto: PyTorch CUDA preferred for {checkpoint.name}",
+                )
             return RuntimeChoice("onnx", onnx_path, f"onnx={onnx_path.name}")
         except ImportError as e:
             log.info("Skipping ONNX Runtime for %s (%s)", checkpoint.name, e)
@@ -253,14 +317,35 @@ class OnnxSession:
             available = ort.get_available_providers()
         except Exception:
             available = []
-        if "TensorrtExecutionProvider" in available:
-            providers.append("TensorrtExecutionProvider")
+        if _use_ort_tensorrt_ep() and "TensorrtExecutionProvider" in available:
+            providers.append((
+                "TensorrtExecutionProvider",
+                {
+                    "device_id": 0,
+                    "trt_fp16_enable": True,
+                    "trt_engine_cache_enable": True,
+                    "trt_engine_cache_path": str(
+                        onnx_path.resolve().parent / ".ort_trt_cache"
+                    ),
+                },
+            ))
         if "CUDAExecutionProvider" in available:
-            providers.append("CUDAExecutionProvider")
+            cuda_opts: dict = {
+                "device_id": 0,
+                "arena_extend_strategy": "kNextPowerOfTwo",
+                "cudnn_conv_algo_search": "HEURISTIC",
+            }
+            if _GPU_PROFILE in ("l4", "a10", "a100"):
+                cuda_opts["gpu_mem_limit"] = 20 * 1024 * 1024 * 1024
+            providers.append(("CUDAExecutionProvider", cuda_opts))
         providers.append("CPUExecutionProvider")
 
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        so.enable_mem_pattern = True
+        so.enable_cpu_mem_arena = True
+        so.intra_op_num_threads = 2
+        so.inter_op_num_threads = 1
         self.session = ort.InferenceSession(str(onnx_path), so, providers=providers)
         self.input_name  = self.session.get_inputs()[0].name
         self.output_name = self.session.get_outputs()[0].name

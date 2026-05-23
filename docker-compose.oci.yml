@@ -1,0 +1,8 @@
+# Optional overrides — use when a reference PDF is on the VM:
+#   docker compose -f docker-compose.yml -f docker-compose.oci.yml up -d
+services:
+  api:
+    volumes:
+      - ${REFERENCE_PDF}:/app/reference/report.pdf:ro
+    environment:
+      NAUTICAI_SOURCE_PDF: /app/reference/report.pdf

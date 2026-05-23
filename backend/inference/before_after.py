@@ -38,6 +38,23 @@ _LOCK = Lock()
 _RUNTIME: Optional[_runtime.RuntimeChoice] = None
 _MODEL = None
 _INPUT_HW: tuple[int, int] = (224, 224)
+_NUM_CLASSES: int = 2
+_CLASS_IDS = ("before", "after", "not_hull")
+
+
+def _load_class_meta() -> tuple[int, tuple[str, ...]]:
+    import json
+    for name in ("Before_and_after_v3.metrics.json", "Before_and_after_v2.metrics.json"):
+        meta_path = config.MODELS_DIR / name
+        if meta_path.is_file():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                n = int(meta.get("num_classes") or 2)
+                names = tuple(meta.get("class_names") or _CLASS_IDS[:n])
+                return n, names
+            except Exception:
+                pass
+    return 2, _CLASS_IDS[:2]
 
 
 def _load_native_keras() -> tuple:
@@ -64,7 +81,7 @@ def _infer_hw_from_onnx(onnx_path) -> tuple[int, int]:
 
 def _load() -> None:
     """Lazy-load on first prediction. Idempotent."""
-    global _MODEL, _INPUT_HW, _RUNTIME
+    global _MODEL, _INPUT_HW, _RUNTIME, _NUM_CLASSES
     if _MODEL is not None:
         return
     _RUNTIME = _runtime.resolve(config.BEFORE_AFTER_CKPT)
@@ -84,9 +101,28 @@ def _load() -> None:
     else:
         _MODEL, _INPUT_HW = _load_native_keras()
 
+    n_meta, names = _load_class_meta()
+    _NUM_CLASSES = n_meta
+    if _RUNTIME.backend == "native" and _MODEL is not None:
+        out_shape = getattr(_MODEL, "output_shape", None)
+        if out_shape is not None and int(out_shape[-1] or 1) > 1:
+            _NUM_CLASSES = int(out_shape[-1])
+    elif _RUNTIME.backend == "onnx":
+        try:
+            import onnx
+            m = onnx.load(str(_RUNTIME.artefact))
+            for o in m.graph.output:
+                dims = [d.dim_value for d in o.type.tensor_type.shape.dim]
+                if dims and int(dims[-1]) > 1:
+                    _NUM_CLASSES = int(dims[-1])
+                    break
+        except Exception:
+            pass
+    log.info("Before/After classes=%d %s", _NUM_CLASSES, names[:_NUM_CLASSES])
+
 
 def predict(pil_img: Image.Image) -> dict:
-    """Return ``{"id": "before"|"after", "confidence": float in [0.5, 1.0]}``."""
+    """Return stage id: before | after | not_hull (3-class model)."""
     with _LOCK:
         _load()
 
@@ -94,18 +130,28 @@ def predict(pil_img: Image.Image) -> dict:
 
     if _RUNTIME.backend in ("trt", "onnx"):
         arr = _runtime.preprocess_keras_effnetv2(pil_img, (h, w))
-        out = _MODEL.infer(arr)
-        p = float(np.asarray(out).reshape(-1)[0])
+        raw = np.asarray(_MODEL.infer(arr)).reshape(-1)
     else:
         img = pil_img.convert("RGB").resize((w, h))
         arr = np.expand_dims(np.array(img, dtype=np.float32), 0)
-        p = float(_MODEL.predict(arr, verbose=0)[0, 0])
+        raw = np.asarray(_MODEL.predict(arr, verbose=0)).reshape(-1)
 
+    if _NUM_CLASSES >= 3 and raw.size >= 3:
+        probs = raw[:3].astype(float)
+        if probs.sum() > 0 and abs(probs.sum() - 1.0) < 0.05:
+            pass
+        elif raw.size == 3:
+            ex = np.exp(probs - probs.max())
+            probs = ex / ex.sum()
+        idx = int(np.argmax(probs))
+        sid = _CLASS_IDS[idx] if idx < len(_CLASS_IDS) else "not_hull"
+        return {"id": sid, "confidence": float(probs[idx])}
+
+    p = float(raw[0])
     if os.environ.get("NAUTICAI_BA_INVERT", "0") == "1":
         p = 1.0 - p
-
     if p >= 0.5:
-        return {"id": "after",  "confidence": p}
+        return {"id": "after", "confidence": p}
     return {"id": "before", "confidence": 1.0 - p}
 
 

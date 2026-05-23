@@ -14,6 +14,7 @@ import numpy as np
 from PIL import Image
 
 from .. import config
+from .. import species_registry as species_reg
 from . import _runtime
 
 log = logging.getLogger("nauticai.species")
@@ -100,7 +101,7 @@ def predict(pil_img: Image.Image) -> dict:
             probs = torch.softmax(logits.float(), dim=0).cpu().tolist()
 
     pairs = sorted(
-        [{"id": c, "display": config.SPECIES_DISPLAY.get(c, c), "prob": float(p)}
+        [{"id": c, "display": species_reg.display_name(c), "prob": float(p)}
          for c, p in zip(_CLASS_NAMES, probs)],
         key=lambda r: -r["prob"],
     )

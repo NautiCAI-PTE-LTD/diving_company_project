@@ -28,6 +28,9 @@ DB_PATH      = STORAGE_DIR / "nauticai.db"
 for d in (STORAGE_DIR, UPLOADS_DIR, REPORTS_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
+# PDF layout: "marine" = NautiCAI report (default); "uw" = client BW BIRCH / Synergy template
+REPORT_TEMPLATE = os.environ.get("NAUTICAI_REPORT_TEMPLATE", "marine").strip().lower()
+
 # ----- model files -------------------------------------------------------
 SHIP_REGION_CKPT  = MODELS_DIR / "Ship_classification_v2.pth"
 # Production Before/After classifier. The v2 model is an EfficientNetV2-B0
@@ -59,6 +62,47 @@ DEVICE          = _auto_device()
 OCR_LANGS       = ["en"]
 OCR_GPU         = DEVICE == "cuda"
 INFERENCE_BATCH = 8
+# Downscale 12 MP phone photos before CNNs (models still see 224×224).
+INFERENCE_MAX_EDGE = int(os.environ.get("NAUTICAI_INFERENCE_MAX_EDGE", "1280") or 1280)
+# OCR keeps more pixels than classifiers (painted names stay readable).
+OCR_MAX_EDGE = int(os.environ.get("NAUTICAI_OCR_MAX_EDGE", "2000") or 2000)
+# Concurrent /api/analyze on GPU — override with NAUTICAI_ANALYZE_CONCURRENCY.
+# l4/a10 profiles default to 4 when using ONNX/TRT (24 GB class cards).
+ANALYZE_CONCURRENCY = int(os.environ.get("NAUTICAI_ANALYZE_CONCURRENCY", "0") or 0)
+
+
+def _auto_gpu_profile() -> str:
+    """Best-effort GPU name → profile slug (empty on CPU / unknown)."""
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            text=True,
+            timeout=3,
+            stderr=subprocess.DEVNULL,
+        )
+        name = (out.strip().splitlines() or [""])[0].upper()
+        if "L4" in name:
+            return "l4"
+        if "A10" in name or "A100" in name:
+            return "a10"
+        if "T4" in name:
+            return "t4"
+        if "ORIN" in name or "XAVIER" in name:
+            return "jetson"
+    except Exception:
+        pass
+    return ""
+
+
+# Cloud GPU profile: l4 | a10 | t4 | jetson — tunes analyze concurrency.
+GPU_PROFILE = os.environ.get("NAUTICAI_GPU_PROFILE", "").strip().lower() or _auto_gpu_profile()
+
+# Photographic Report opener: use the image whose OCR matches the report vessel name
+# (same photo as step-1 detection), not a random hull shot.
+PHOTO_COVER_MATCH_OCR_NAME = os.environ.get(
+    "NAUTICAI_PHOTO_COVER_MATCH_OCR_NAME", "1",
+).strip().lower() not in ("0", "false", "no")
 
 # ----- GPU performance knobs --------------------------------------------
 # FP16 autocast on CUDA forward passes. Safe for inference (weights stay
@@ -96,6 +140,21 @@ def _tune_torch_once() -> None:
 
 _tune_torch_once()
 
+
+def default_analyze_concurrency(*, region_backend: str, species_backend: str) -> int:
+    """How many /api/analyze calls may run models at once."""
+    if ANALYZE_CONCURRENCY > 0:
+        return ANALYZE_CONCURRENCY
+    if DEVICE != "cuda":
+        return 2
+    onnx_family = region_backend in ("onnx", "trt") and species_backend in ("onnx", "trt")
+    if GPU_PROFILE in ("l4", "a10", "a100"):
+        return 4 if onnx_family else 2
+    if GPU_PROFILE == "t4":
+        return 2
+    return 2 if onnx_family else 1
+
+
 # ----- database & auth --------------------------------------------------
 # If DATABASE_URL is set (Supabase / generic Postgres), use it. Otherwise the
 # local SQLite file under storage/ is used so dev still works out-of-the-box.
@@ -123,12 +182,56 @@ HULL_REGION_DISPLAY = {
     "Verticle_Slide": "Vertical Side (Hull)",
     "stren": "Stern Frame",
 }
-SPECIES = ["algae", "barnacles", "clean_paint", "macroalgae", "mussels"]
-SPECIES_DISPLAY = {
-    "algae": "Algae", "barnacles": "Barnacles", "clean_paint": "Clean Paint",
-    "macroalgae": "Macroalgae", "mussels": "Mussels",
-}
-STAGES = ["before", "after"]
+SPECIES_FALLBACK = [
+    "algae", "barnacles", "clean_paint", "macroalgae", "mussels",
+]
+SPECIES = list(SPECIES_FALLBACK)
+SPECIES_VESSEL_COVER_ID = "vessel_cover"
+SPECIES_DISPLAY: dict[str, str] = {}
+# Whole-ship photos for OCR + Photographic Report cover (negative examples for species/BA).
+SHIP_COVER_REFERENCE_DIR = Path(
+    os.environ.get("NAUTICAI_SHIP_COVER_DIR", r"F:\ship_image")
+)
+STAGES = ["before", "after", "not_hull"]
+
+# Temporary species ↔ before/after gating (until dataset retrain).
+# Before: never keep clean_paint as top — use fouling classes only.
+# After: prefer clean_paint when prob >= min; skip if fouling class is dominant.
+SPECIES_STAGE_GATE = os.environ.get("NAUTICAI_SPECIES_STAGE_GATE", "1").strip().lower() in (
+    "1", "true", "yes",
+)
+SPECIES_CLEAN_AFTER_MIN_PROB = float(
+    os.environ.get("NAUTICAI_SPECIES_CLEAN_AFTER_MIN_PROB", "0.30") or 0.30
+)
+SPECIES_AFTER_KEEP_FOULING_MIN = float(
+    os.environ.get("NAUTICAI_SPECIES_AFTER_KEEP_FOULING_MIN", "0.72") or 0.72
+)
+
+# ----- PDF generation (fast mode on by default for large batches) ----------
+PDF_FAST = os.environ.get("NAUTICAI_PDF_FAST", "1").strip().lower() not in (
+    "0", "false", "no",
+)
+# Max photos per before/after grid per region (0 = embed every photo — slow).
+PDF_MAX_PHOTOS_PER_STAGE = int(
+    os.environ.get(
+        "NAUTICAI_PDF_MAX_PHOTOS_PER_STAGE",
+        "9" if PDF_FAST else "0",
+    ) or 0,
+)
+# BIRCH template normally builds the PDF twice for TOC page numbers; skip when fast.
+PDF_BIRCH_SINGLE_PASS = os.environ.get(
+    "NAUTICAI_PDF_BIRCH_SINGLE_PASS",
+    "1" if PDF_FAST else "0",
+).strip().lower() not in ("0", "false", "no")
+PDF_THUMB_WORKERS = max(1, int(os.environ.get("NAUTICAI_PDF_THUMB_WORKERS", "8") or 8))
+PDF_THUMB_QUALITY = max(
+    50,
+    min(95, int(os.environ.get("NAUTICAI_PDF_THUMB_QUALITY", "72" if PDF_FAST else "80") or 80)),
+)
+PDF_THUMB_CACHE_LIMIT = int(
+    os.environ.get("NAUTICAI_PDF_THUMB_CACHE_LIMIT", "4096" if PDF_FAST else "256") or 256,
+)
+
 
 # Mapping species severity → A/B/C/D scale used in the marine PDF
 def severity_from(fouling_pct: float, top_species: str) -> str:

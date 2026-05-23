@@ -17,6 +17,8 @@ export default defineConfig({
       '/api': {
         target: 'http://localhost:8000',
         changeOrigin: true,
+        // Large reports (700+ photos) — PDF generate can run several minutes
+        timeout: 900_000,
       },
     },
   },

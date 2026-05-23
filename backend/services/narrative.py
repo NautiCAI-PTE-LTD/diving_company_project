@@ -1,12 +1,11 @@
 """Generate the natural-language sentences that fill the
 'Fouling Conditions Executive Summary' table.
 
-The phrasing is **not** random — every one of the 12 rows uses a fixed
-sentence template taken verbatim from the source marine service report
-(``marine_service_report (2).pdf``). Only the **species** and the
-**thickness range** are filled in from AI analysis. This gives the report
-the exact look of a surveyor-written document while keeping the inferred
-data honest.
+Each row uses a **surveyor-style sentence template** (fixed grammar), but
+**species**, **coverage %**, **thickness range**, **severity**, and
+**cleaning Yes/No** all come from the AI analysis of *your* uploaded images
+(``cluster.cluster_images`` → ``species_counts`` + ``avg_fouling``). Nothing
+is copied from a reference PDF.
 
 Methodology
 -----------
@@ -118,27 +117,36 @@ CLEAN_TEMPLATES: Dict[str, str] = {
 #     short algae growth — which is what our 'algae' class mostly catches)
 #   - "barnacles", "mussels", "Algae" (macroalgae) follow template casing
 SPECIES_LABEL = {
-    "algae":       "Slime",
-    "macroalgae":  "Algae",
-    "barnacles":   "Barnacles",
-    "mussels":     "Mussels",
+    "slime": "Slime",
+    "algae": "Algae",
+    "macroalgae": "Algae",
+    "grass": "grass",
+    "barnacles": "Barnacles",
+    "mussels": "Mussels",
+    "tubeworms": "tube worms",
+    "goosenecks": "goosenecks",
+    "calcareous": "calcareous deposits",
+    "mixed_fouling": "mixed fouling",
     "clean_paint": "clean paint",
+    "vessel_cover": "clean paint",
 }
 
-# When the species is a *secondary* (`X and y`), the source PDF tends to
-# write the trailing species in lowercase (e.g. "Slime and barnacles").
 SPECIES_LABEL_SECONDARY = {
-    "algae":       "slime",
-    "macroalgae":  "algae",
-    "barnacles":   "barnacles",
-    "mussels":     "mussels",
+    "slime": "slime",
+    "algae": "algae",
+    "macroalgae": "algae",
+    "grass": "grass",
+    "barnacles": "barnacles",
+    "mussels": "mussels",
+    "tubeworms": "tube worms",
+    "goosenecks": "goosenecks",
+    "calcareous": "calcareous deposits",
+    "mixed_fouling": "mixed fouling",
     "clean_paint": "clean paint",
+    "vessel_cover": "clean paint",
 }
 
-# Whether the species is "hard" fouling (calcareous shellfish). Hard
-# fouling occupies a slightly thicker layer for the same coverage %, so
-# the thickness range is bumped up one bracket.
-_HARD_SPECIES = {"barnacles", "mussels"}
+_HARD_SPECIES = {"barnacles", "mussels", "goosenecks", "tubeworms", "calcareous"}
 
 
 # --------------------------------------------------------- thickness model
@@ -221,8 +229,10 @@ def narrative_for_location(template_id: str,
     pct: float                       = float(meta.get("avg_fouling", 0.0) or 0.0)
     image_count                      = int(meta.get("count", 0) or 0)
 
-    # ignore clean_paint when reasoning about *fouling* species
-    fouling = {k: v for k, v in species_counts.items() if k != "clean_paint"}
+    fouling = {
+        k: v for k, v in species_counts.items()
+        if k not in ("clean_paint", "vessel_cover") and v > 0
+    }
 
     # ---- "clean" branch ----------------------------------------
     if not fouling or pct < 10:

@@ -26,7 +26,9 @@ def cluster_images(images) -> Dict[str, Dict[str, List[dict]]]:
         # Wide ship-overview photos never go into hull-region buckets.
         if region in NON_HULL_REGIONS:
             continue
-        stage  = img.stage if img.stage in config.STAGES else "before"
+        if (img.stage or "") not in config.STAGES:
+            continue
+        stage  = img.stage
         bucket = out.setdefault(region, {"before": [], "after": [], "_meta": {
             "region_id": region,
             "region_display": config.HULL_REGION_DISPLAY.get(region, region),
@@ -42,7 +44,17 @@ def cluster_images(images) -> Dict[str, Dict[str, List[dict]]]:
         meta = bucket["_meta"]
         meta["count"] += 1
         meta["avg_fouling"] += img.fouling_pct or 0.0
-        meta["species_counts"][img.species_top or "unknown"] += 1
+        dist = img.species_dist if isinstance(img.species_dist, list) else []
+        added = False
+        for entry in dist:
+            if isinstance(entry, dict):
+                sid = entry.get("id") or entry.get("species")
+                prob = float(entry.get("prob", 0) or 0)
+                if sid and prob > 0.05:
+                    meta["species_counts"][sid] = meta["species_counts"].get(sid, 0) + prob
+                    added = True
+        if not added:
+            meta["species_counts"][img.species_top or "unknown"] += 1
         meta["severities"][img.severity or "A"] += 1
 
     # finalise meta

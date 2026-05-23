@@ -1,0 +1,41 @@
+# Production stack for Oracle Cloud VM (backend + optional local Postgres).
+# Copy deploy/oracle-cloud/env.production.example → .env before `docker compose up -d`.
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: nauticai-backend:latest
+    container_name: nauticai-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NAUTICAI_DEVICE: ${NAUTICAI_DEVICE:-cpu}
+      NAUTICAI_FP16: ${NAUTICAI_FP16:-0}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - ${DATA_DIR:-./data}/Models:/app/Models:ro
+      - ${DATA_DIR:-./data}/storage:/app/backend/storage
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  # Optional — remove if you use Supabase / OCI Autonomous Postgres (set DATABASE_URL in .env).
+  db:
+    profiles: ["local-db"]
+    image: postgres:16-alpine
+    container_name: nauticai-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-nauticai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-nauticai}
+    volumes:
+      - ${DATA_DIR:-./data}/postgres:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"

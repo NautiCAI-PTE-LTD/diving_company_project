@@ -77,6 +77,16 @@ You should see `device: cuda`, `warmup: ready`, and `model_backends.*.backend: n
 
 ---
 
+## Oracle Cloud (backend VM)
+
+Deploy the API with Docker on **OCI Compute** (CPU inference, Postgres, persistent volumes):
+
+[`deploy/oracle-cloud/README.md`](deploy/oracle-cloud/README.md)
+
+Quick start on the VM: `./deploy/oracle-cloud/bootstrap.sh` → configure `.env` → `docker compose up -d`.
+
+---
+
 ## Jetson Orin Nano deployment
 
 The repo includes a full end-to-end recipe in [`deploy/jetson/README.md`](deploy/jetson/README.md):

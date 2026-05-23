@@ -24,6 +24,23 @@ backend\run.bat
 
 Open <http://localhost:8000/docs> for the live OpenAPI explorer.
 
+## Inference speed (GPU)
+
+1. Export ONNX once: `python scripts/export_onnx.py`
+2. On a GPU server (L4/A10/Jetson): `python scripts/build_trt.py --fp16` → `Models/*.engine`
+3. Or run `./deploy/gcp-l4/setup_gpu_models.sh` on the GCP L4 VM.
+4. Restart API — `/api/system` should show `trt` or `onnx` backends on `cuda`.
+3. Optional env vars:
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `NAUTICAI_INFERENCE_MAX_EDGE` | `1280` | Downscale 12 MP photos before CNNs (~3× faster) |
+| `NAUTICAI_ANALYZE_CONCURRENCY` | `2` on GPU+ONNX | Two analyses at once on the GPU |
+| `NAUTICAI_FP16` | `1` | FP16 autocast on CUDA PyTorch paths |
+| `NAUTICAI_BACKEND` | `auto` | Set `onnx` to force ONNX Runtime |
+
+OCR runs only on cover/nameplate candidates (not every underwater shot).
+
 ## Endpoints (overview)
 
 - `GET  /api/health`

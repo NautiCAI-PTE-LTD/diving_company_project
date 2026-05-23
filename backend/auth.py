@@ -12,24 +12,26 @@ from typing import Optional
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import jwt, JWTError
-from passlib.context import CryptContext
+import bcrypt
 
 from . import config
 from .db import db_session, User, Company
 
-# bcrypt with a sensible cost
-_pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
 _bearer = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=False)
 
 
 # ---------------- password ----------------
+# Use bcrypt directly — passlib 1.7 + bcrypt 5.x break verify/hash on Windows.
 def hash_password(password: str) -> str:
-    return _pwd.hash(password)
+    digest = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=12))
+    return digest.decode("utf-8")
 
 
 def verify_password(password: str, hashed: str) -> bool:
+    if not hashed:
+        return False
     try:
-        return _pwd.verify(password, hashed)
+        return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
     except Exception:
         return False
 

@@ -12,6 +12,20 @@ on a Jetson Orin Nano with TensorRT FP16 inference. Tested against
 
 ## 0. One-time host checks
 
+### Collect a full system report (send to your deploy contact)
+
+On the Jetson, from the repo (or after copying the script):
+
+```bash
+chmod +x scripts/jetson-discovery.sh
+./scripts/jetson-discovery.sh
+# → jetson-discovery-report.txt (hardware, JetPack, Models/, venv, APIs, network)
+```
+
+Fill in section **13. YOUR ANSWERS** in that file, then `scp` it to your PC and share it.
+
+Quick manual checks:
+
 ```bash
 # Verify JetPack components
 dpkg -l | grep -E "nvidia-l4t-core|nvidia-jetpack|tensorrt|cuda-toolkit"

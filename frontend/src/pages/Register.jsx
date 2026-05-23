@@ -95,7 +95,7 @@ export default function Register() {
       }
       await refreshBrand()
       toast.success(`Welcome ${r.company.company_name}!`)
-      nav(skipExtras ? '/settings' : '/', { replace: true })
+      // AuthGate validates the session and opens the main app.
     } catch (err) {
       const det = err?.response?.data?.detail
       const msg = Array.isArray(det) ? det.map((d) => d.msg).join(', ')

@@ -80,20 +80,20 @@ CANDIDATE_DIRS = {
         ROOT / "Rerun model" / "After",
     ],
 }
+DEFAULT_OVERWATER_DIR = Path(r"F:\ship_image")
+LABEL_NAMES = {0: "before", 1: "after", 2: "not_hull"}
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 SEED = 42
 
 
 # ----------------------------------------------------------- data discovery ----
-def discover_images() -> list[tuple[Path, int]]:
-    """Return list of (path, label) where label is 0='before', 1='after'.
-
-    Deduplicates by SHA-1 of file bytes so the same photo (which can sit in
-    both the extracted and Rerun-model folders) isn't double-counted.
-    Conflict policy: if the same SHA-1 appears under both labels, drop it
-    (it's ambiguous and would just confuse training).
-    """
-    label_to_id = {"before": 0, "after": 1}
+def discover_images(
+    *,
+    overwater_dir: Path | None = None,
+    three_class: bool = False,
+) -> list[tuple[Path, int]]:
+    """Return list of (path, label): 0=before, 1=after, 2=not_hull (overwater)."""
+    label_to_id = {"before": 0, "after": 1, "not_hull": 2}
     by_sha: dict[str, tuple[Path, str]] = {}
     conflicts: set[str] = set()
 
@@ -112,20 +112,37 @@ def discover_images() -> list[tuple[Path, int]]:
                 if sha in by_sha:
                     if by_sha[sha][1] != label:
                         conflicts.add(sha)
-                    continue  # duplicate within same label -> ignore
+                    continue
                 by_sha[sha] = (p, label)
 
     items = [(path, label_to_id[lab]) for sha, (path, lab) in by_sha.items()
              if sha not in conflicts]
     if conflicts:
-        print(f"  dropped {len(conflicts)} images that appeared in BOTH classes")
+        print(f"  dropped {len(conflicts)} images that appeared in BOTH before/after")
+
+    if three_class and overwater_dir and overwater_dir.is_dir():
+        hull_shas = set(by_sha.keys())
+        added = 0
+        for p in sorted(overwater_dir.iterdir()):
+            if not p.is_file() or p.suffix.lower() not in IMG_EXTS:
+                continue
+            try:
+                sha = hashlib.sha1(p.read_bytes()).hexdigest()
+            except OSError:
+                continue
+            if sha in hull_shas or sha in conflicts:
+                continue
+            items.append((p, 2))
+            added += 1
+        print(f"  added {added} not_hull images from {overwater_dir}")
     return items
 
 
 def stratified_split(items: list[tuple[Path, int]],
                      val_frac=0.15, test_frac=0.15, seed=SEED):
     rng = random.Random(seed)
-    by_label: dict[int, list[tuple[Path, int]]] = {0: [], 1: []}
+    labels = sorted({y for _, y in items})
+    by_label: dict[int, list[tuple[Path, int]]] = {y: [] for y in labels}
     for p, y in items:
         by_label[y].append((p, y))
     train, val, test = [], [], []
@@ -175,9 +192,7 @@ def make_dataset(items, img_size: int, batch: int,
 
 
 # ----------------------------------------------------------- model ----
-def build_model(img_size: int, dropout=0.30) -> Model:
-    # Build the backbone *standalone* first so it stays a true nested Model
-    # in our top-level network; that's what `unfreeze_top` looks for later.
+def build_model(img_size: int, dropout=0.30, *, num_classes: int = 2) -> Model:
     backbone = EfficientNetV2B0(include_top=False, include_preprocessing=True,
                                 weights="imagenet", pooling=None,
                                 input_shape=(img_size, img_size, 3))
@@ -190,8 +205,13 @@ def build_model(img_size: int, dropout=0.30) -> Model:
                      kernel_regularizer=tf.keras.regularizers.l2(1e-4),
                      name="head_dense")(x)
     x = layers.Dropout(dropout, name="dropout_2")(x)
-    outputs = layers.Dense(1, activation="sigmoid", name="head_out")(x)
-    return Model(inputs, outputs, name="before_after_v2")
+    if num_classes <= 2:
+        outputs = layers.Dense(1, activation="sigmoid", name="head_out")(x)
+        name = "before_after_v2"
+    else:
+        outputs = layers.Dense(num_classes, activation="softmax", name="head_out")(x)
+        name = "before_after_v3"
+    return Model(inputs, outputs, name=name)
 
 
 def unfreeze_top(model: Model, fraction: float = 0.30) -> int:
@@ -224,7 +244,8 @@ def unfreeze_top(model: Model, fraction: float = 0.30) -> int:
 def class_weights_for(items) -> dict[int, float]:
     counts = Counter(y for _, y in items)
     total = sum(counts.values())
-    return {y: total / (2.0 * counts[y]) for y in counts}
+    n_cls = max(len(counts), 1)
+    return {y: total / (n_cls * counts[y]) for y in counts}
 
 
 def confusion_matrix(y_true, y_pred):
@@ -235,6 +256,46 @@ def confusion_matrix(y_true, y_pred):
 
 
 def fmt_pct(num, den): return f"{(100.0*num/den):5.1f}%" if den else "  n/a"
+
+
+def evaluate_split_multiclass(model: Model, items, img_size: int, batch: int,
+                              name="test") -> dict:
+    ds_eval = make_dataset(items, img_size, batch, shuffle=False, augment=False)
+    probs = model.predict(ds_eval, verbose=0)
+    if probs.ndim == 1:
+        probs = probs.reshape(-1, 1)
+    preds = np.argmax(probs, axis=1).astype("int32")
+    truth = np.array([y for _, y in items], dtype="int32")
+    acc = float((preds == truth).mean()) if len(items) else 0.0
+    labels = sorted(set(truth.tolist()) | set(preds.tolist()))
+
+    print(f"\n  ===== {name.upper()} SET (n={len(items)}) — 3-class =====")
+    hdr = "gt\\pred   " + "".join(f"{LABEL_NAMES.get(i, i):>10}" for i in labels)
+    print(hdr)
+    cm: dict[tuple[int, int], int] = {}
+    for t, p in zip(truth, preds):
+        cm[(int(t), int(p))] = cm.get((int(t), int(p)), 0) + 1
+    for t in labels:
+        row = f"  {LABEL_NAMES.get(t, t):>9}"
+        for p in labels:
+            row += f"{cm.get((t, p), 0):10d}"
+        print(row)
+    print(f"     accuracy        : {acc*100:5.1f}%")
+    per_class = {}
+    for c in labels:
+        mask = truth == c
+        if mask.any():
+            per_class[LABEL_NAMES.get(c, str(c))] = float((preds[mask] == c).mean())
+    print(f"     per-class recall  : {per_class}")
+    return {
+        "n": len(items), "accuracy": acc, "per_class_recall": per_class,
+        "confusion": {f"{LABEL_NAMES.get(t, t)}->{LABEL_NAMES.get(p, p)}": v
+                      for (t, p), v in cm.items()},
+        "predictions": list(zip(
+            [str(p) for p, _ in items], truth.tolist(), preds.tolist(),
+            [probs[i].astype(float).tolist() for i in range(len(items))],
+        )),
+    }
 
 
 def evaluate_split(model: Model, items, img_size: int, batch: int,
@@ -287,6 +348,10 @@ def main() -> int:
     ap.add_argument("--no-finetune", action="store_true",
                     help="Skip stage 2, save only the head-trained model")
     ap.add_argument("--unfreeze-frac", type=float, default=0.30)
+    ap.add_argument("--three-class", action="store_true",
+                    help="Add not_hull class from overwater ship photos")
+    ap.add_argument("--overwater-dir", type=Path, default=DEFAULT_OVERWATER_DIR,
+                    help="Whole-ship / overwater negatives (label not_hull)")
     args = ap.parse_args()
 
     tf.keras.utils.set_random_seed(SEED)
@@ -296,11 +361,13 @@ def main() -> int:
     gpus = tf.config.list_physical_devices("GPU")
     print(f"   GPUs visible to TF: {[g.name for g in gpus] or 'none (CPU)'}")
 
+    three_class = args.three_class
     print("\nDiscovering images...")
-    items = discover_images()
+    items = discover_images(overwater_dir=args.overwater_dir, three_class=three_class)
     counts = Counter(y for _, y in items)
-    print(f"   total kept: {len(items)}   before={counts[0]}   after={counts[1]}")
-    if min(counts.values()) < 30:
+    count_str = "   ".join(f"{LABEL_NAMES.get(k, k)}={counts[k]}" for k in sorted(counts))
+    print(f"   total kept: {len(items)}   {count_str}")
+    if min(counts.values()) < 20:
         print("WARNING: very few images per class — accuracy will be unstable.")
 
     train, val, test = stratified_split(items)
@@ -312,13 +379,23 @@ def main() -> int:
     train_ds = make_dataset(train, args.img_size, args.batch, shuffle=True,  augment=True)
     val_ds   = make_dataset(val,   args.img_size, args.batch, shuffle=False, augment=False)
 
-    print("\nBuilding model (EfficientNetV2-B0 + custom head, backbone frozen)...")
-    model = build_model(args.img_size)
+    num_classes = 3 if three_class else 2
+    print(f"\nBuilding model (EfficientNetV2-B0, {num_classes} classes, backbone frozen)...")
+    model = build_model(args.img_size, num_classes=num_classes)
     n_total = sum(int(np.prod(w.shape)) for w in model.weights)
     n_train = sum(int(np.prod(w.shape)) for w in model.trainable_weights)
     print(f"   params: total={n_total:,}   trainable={n_train:,}")
 
-    out_path = MODELS_DIR / "Before_and_after_v2.keras"
+    out_path = MODELS_DIR / ("Before_and_after_v3.keras" if three_class
+                             else "Before_and_after_v2.keras")
+    loss = "sparse_categorical_crossentropy" if three_class else "binary_crossentropy"
+    metrics = ["accuracy"]
+    if not three_class:
+        metrics.extend([
+            tf.keras.metrics.AUC(name="auc"),
+            tf.keras.metrics.Precision(name="precision"),
+            tf.keras.metrics.Recall(name="recall"),
+        ])
     cb_list = [
         callbacks.ModelCheckpoint(str(out_path), monitor="val_loss",
                                   save_best_only=True, mode="min", verbose=0),
@@ -330,14 +407,7 @@ def main() -> int:
 
     # ---- Stage 1: head only ----
     print(f"\nStage 1: train head only ({args.epochs1} epochs, lr={args.lr1})")
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(args.lr1),
-        loss="binary_crossentropy",
-        metrics=["accuracy",
-                 tf.keras.metrics.AUC(name="auc"),
-                 tf.keras.metrics.Precision(name="precision"),
-                 tf.keras.metrics.Recall(name="recall")],
-    )
+    model.compile(optimizer=tf.keras.optimizers.Adam(args.lr1), loss=loss, metrics=metrics)
     t0 = time.perf_counter()
     h1 = model.fit(train_ds, validation_data=val_ds,
                    epochs=args.epochs1, class_weight=cw,
@@ -353,14 +423,7 @@ def main() -> int:
         n_train2 = sum(int(np.prod(w.shape)) for w in model.trainable_weights)
         print(f"\nStage 2: fine-tune top {args.unfreeze_frac*100:.0f}% of backbone "
               f"({n_unfrozen} layers unfrozen, trainable params={n_train2:,})")
-        model.compile(
-            optimizer=tf.keras.optimizers.Adam(args.lr2),
-            loss="binary_crossentropy",
-            metrics=["accuracy",
-                     tf.keras.metrics.AUC(name="auc"),
-                     tf.keras.metrics.Precision(name="precision"),
-                     tf.keras.metrics.Recall(name="recall")],
-        )
+        model.compile(optimizer=tf.keras.optimizers.Adam(args.lr2), loss=loss, metrics=metrics)
         t0 = time.perf_counter()
         h2 = model.fit(train_ds, validation_data=val_ds,
                        epochs=args.epochs2, class_weight=cw,
@@ -375,20 +438,28 @@ def main() -> int:
     print(f"\nReloading best snapshot from {out_path.name}")
     model = tf.keras.models.load_model(out_path)
 
-    # Final eval
-    val_metrics  = evaluate_split(model, val,  args.img_size, args.batch, name="val")
-    test_metrics = evaluate_split(model, test, args.img_size, args.batch, name="test")
+    if three_class:
+        val_metrics  = evaluate_split_multiclass(model, val,  args.img_size, args.batch, name="val")
+        test_metrics = evaluate_split_multiclass(model, test, args.img_size, args.batch, name="test")
+    else:
+        val_metrics  = evaluate_split(model, val,  args.img_size, args.batch, name="val")
+        test_metrics = evaluate_split(model, test, args.img_size, args.batch, name="test")
 
-    # Save metrics + history + per-image csvs
-    metrics_path = MODELS_DIR / "Before_and_after_v2.metrics.json"
-    history_path = MODELS_DIR / "Before_and_after_v2.history.csv"
-    pred_path    = ROOT / "eval_v2_predictions.csv"
-    miss_path    = ROOT / "eval_v2_mismatches.csv"
+    tag = "v3" if three_class else "v2"
+    metrics_path = MODELS_DIR / f"Before_and_after_{tag}.metrics.json"
+    history_path = MODELS_DIR / f"Before_and_after_{tag}.history.csv"
+    pred_path    = ROOT / f"eval_{tag}_predictions.csv"
+    miss_path    = ROOT / f"eval_{tag}_mismatches.csv"
+
+    data_summary = {"total": len(items), "train": len(train), "val": len(val), "test": len(test)}
+    for k in sorted(counts):
+        data_summary[LABEL_NAMES.get(k, str(k))] = counts[k]
 
     summary = {
-        "data": {"total": len(items), "before": counts[0], "after": counts[1],
-                 "train": len(train), "val": len(val), "test": len(test)},
-        "args": vars(args),
+        "num_classes": num_classes,
+        "class_names": [LABEL_NAMES[i] for i in range(num_classes)],
+        "data": data_summary,
+        "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         "val":  {k: v for k, v in val_metrics.items()  if k != "predictions"},
         "test": {k: v for k, v in test_metrics.items() if k != "predictions"},
         "model_path": str(out_path),
@@ -406,11 +477,17 @@ def main() -> int:
                                  for k in keys]
                 w.writerow(row)
 
-    label_name = {0: "before", 1: "after"}
-    rows_all = [{"path": p, "gt": label_name[t], "pred": label_name[pp],
-                 "probability_after": round(pr, 4),
-                 "correct": int(t == pp)}
-                for (p, t, pp, pr) in test_metrics["predictions"]]
+    label_name = LABEL_NAMES
+    rows_all = []
+    for row in test_metrics["predictions"]:
+        p, t, pp, pr = row[0], row[1], row[2], row[3]
+        entry = {"path": p, "gt": label_name[t], "pred": label_name[pp], "correct": int(t == pp)}
+        if isinstance(pr, list):
+            for i, prob in enumerate(pr):
+                entry[f"prob_{label_name.get(i, i)}"] = round(float(prob), 4)
+        else:
+            entry["probability_after"] = round(float(pr), 4)
+        rows_all.append(entry)
     with pred_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=list(rows_all[0].keys()))
         w.writeheader(); w.writerows(rows_all)
@@ -427,6 +504,15 @@ def main() -> int:
     print(f"   {miss_path.name}  -- test-set mistakes ({len(miss_rows)})")
     print(f"\nTEST ACCURACY = {test_metrics['accuracy']*100:.2f}%   "
           f"(n={test_metrics['n']})")
+
+    if three_class and out_path.is_file():
+        prod = MODELS_DIR / "Before_and_after_v2.keras"
+        import shutil
+        shutil.copy2(out_path, prod)
+        summary["production_copy"] = str(prod)
+        metrics_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        print(f"   Copied best model -> {prod} (production path)")
+
     return 0
 
 

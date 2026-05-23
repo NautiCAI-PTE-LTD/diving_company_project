@@ -4,20 +4,24 @@ import { motion, AnimatePresence } from 'framer-motion'
 import {
   ArrowLeft, ArrowRight, Anchor, ShieldCheck, Sparkles, FileDown, Loader2,
   Clock, Camera, ListChecks, ClipboardCheck, Plus, X, ChevronDown, ChevronRight,
-  Trash2, AlertTriangle, Video, Film, Check, Wand2, Building2, Users, ScanText,
+  Trash2, AlertTriangle, Video, Film, Check, Wand2, Building2, Users,
   Image as ImageIcon,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 import Stepper from '../components/Stepper'
 import ImageDropzone from '../components/ImageDropzone'
-import VesselOcrCard from '../components/VesselOcrCard'
+import PhotographicCoverPanel from '../components/PhotographicCoverPanel'
 import ClientPicker from '../components/ClientPicker'
 import { useReport, emptyFindings } from '../store/reportStore'
 import { HULL_REGIONS, VESSEL_TYPES, VESSEL_CLASSES } from '../lib/constants'
 import {
   analyzeImage, analyzeVideo, isVideoFile, fetchImageObjectUrl,
-  createReport, generateReportPdf, openReportPdf,
+  createReport, generateReportPdf, openReportPdf, ocrVessel, checkBackendOnline, friendlyApiDetail,
 } from '../lib/api'
+import {
+  applyVesselOcrToReport,
+  isCoverOnlyResult,
+} from '../lib/vesselCover'
 
 const STEPS = [
   { id: 'images',    title: 'Upload Raw Data' },
@@ -27,6 +31,25 @@ const STEPS = [
 ]
 
 const REGIONS_WITH_DETAIL = ['Bilege_keels', 'Sea_chest', 'Propeller', 'Radder', 'Rope']
+
+function formatVesselSummaryValue(key, value) {
+  if (value == null || value === '') return '—'
+  if (key === 'client' && typeof value === 'object') {
+    const c = value
+    return [c.company, c.contact_person].filter(Boolean).join(' · ') || '—'
+  }
+  if (key === 'crews' && Array.isArray(value)) {
+    return value.map((c) => c.label || c.supervisor || 'Crew').filter(Boolean).join(', ') || '—'
+  }
+  if (key === 'client_reps' && Array.isArray(value)) {
+    return value.map((r) => `${r.role || 'Rep'}: ${r.name || '—'}`).join('; ') || '—'
+  }
+  if (key === 'team' && Array.isArray(value)) {
+    return value.map((m) => `${m.role || ''}: ${m.name || ''}`.trim()).filter(Boolean).join('; ') || '—'
+  }
+  if (typeof value === 'object') return '—'
+  return String(value)
+}
 
 export default function NewReport() {
   const r = useReport()
@@ -60,8 +83,22 @@ export default function NewReport() {
       toast.error('Please enter a vessel name first')
       return
     }
+    if (!r.vesselImageId?.trim()) {
+      toast.error(
+        'Photographic Report cover is required — open Vessel & Job, re-detect the nameplate, then click "Use for report".',
+      )
+      r.setStep(1)
+      return
+    }
     setBusy(true)
     try {
+      if (!(await checkBackendOnline())) {
+        toast.error(
+          'Backend is not running — start it on http://127.0.0.1:8000 before generating a PDF.',
+          { duration: 8000 },
+        )
+        return
+      }
       // 1. analyse anything that's still pending (no region hint — AI routes)
       const pending = []
       for (const region of HULL_REGIONS) {
@@ -94,21 +131,36 @@ export default function NewReport() {
         vessel: r.vessel,
         image_ids: imageIds,
         region_inspections: r.regionInspections,
-        vessel_image_id: r.vesselImageId || '',
+        vessel_image_id: r.vesselImageId.trim(),
         client_id: r.clientId || null,
       })
       toast.success(`Report ${report.id} created`)
 
-      // 4. build the PDF
+      // 4. build the PDF (can take several minutes on large batches)
+      toast('Building PDF (fast mode — representative photos per section)…', { duration: 10000 })
       await generateReportPdf(report.id)
       toast.success('PDF generated')
-      await openReportPdf(report.id)
 
-      // 5. reset & go to Reports
+      // 5. open PDF (separate step — build may succeed while download times out)
+      try {
+        await openReportPdf(report.id)
+      } catch (openErr) {
+        toast.error(
+          `PDF saved but could not open in browser: ${openErr?.response?.data?.detail || openErr?.message || openErr}. Open it from Reports.`,
+        )
+        nav('/reports')
+        return
+      }
+
       r.reset()
       nav('/reports')
     } catch (e) {
-      toast.error(`Failed: ${e?.response?.data?.detail || e?.message || e}`)
+      const raw = e?.response?.data?.detail || e?.message || String(e)
+      const msg = friendlyApiDetail(
+        typeof raw === 'string' ? raw : JSON.stringify(raw),
+        'Report or PDF failed',
+      )
+      toast.error(`Failed: ${msg}`, { duration: 8000 })
     } finally { setBusy(false) }
   }
 
@@ -170,53 +222,17 @@ export default function NewReport() {
 // ---------------------------------------------------------------- Step 1 ----
 function VesselStep() {
   const r = useReport()
-  const { vessel, updateVessel,
-    setVesselImageId, vesselImageId,
-    clientId, setClientFromDirectory } = r
+  const { vessel, updateVessel, clientId, setClientFromDirectory, ensureVesselCover, vesselImageId } = r
   const set = (k) => (e) => updateVessel({ [k]: e.target.value })
-
-  // The OCR card is now a fallback: it only shows when Step 1's
-  // auto-router didn't already produce a vessel name. If the user wants
-  // to re-detect from a different photo, the "Re-detect" link below
-  // toggles the card back on.
-  const [ocrOpen, setOcrOpen] = useState(false)
   const hasName = Boolean((vessel.vesselName || '').trim())
-  const showOcrCard = !hasName || ocrOpen
+
+  useEffect(() => {
+    ensureVesselCover(true)
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps -- panel re-OCRs cover image
 
   return (
     <div className="space-y-4">
-      {showOcrCard && (
-        <VesselOcrCard
-          defaultOpen={ocrOpen || !hasName}
-          onApply={(name, imageId) => {
-            updateVessel({ vesselName: name })
-            if (imageId) {
-              setVesselImageId(imageId)
-              toast.success('Vessel photo will appear in the report')
-            }
-            setOcrOpen(false)
-          }}
-        />
-      )}
-      {hasName && !ocrOpen && (
-        <div className="flex flex-wrap items-center gap-2 -mt-1 ml-1 text-[11px]">
-          <span className="pill-success">Detected from uploads · {vessel.vesselName}</span>
-          {vesselImageId && (
-            <span className="pill-mute">● Vessel photo attached to report</span>
-          )}
-          <button
-            type="button"
-            onClick={() => setOcrOpen(true)}
-            className="text-brand-300 hover:text-brand-200 inline-flex items-center gap-1">
-            <ScanText size={11} /> Re-detect from a different photo
-          </button>
-        </div>
-      )}
-      {!hasName && vesselImageId && (
-        <div className="text-[11px] text-emerald-300/90 -mt-2 ml-1">
-          ● Vessel photo attached to this report
-        </div>
-      )}
+      <PhotographicCoverPanel defaultOcrOpen={!hasName} />
 
       {/* CLIENT / VESSEL OWNER — picked from saved directory (one-time entry) */}
       <section className="glass rounded-2xl p-5">
@@ -508,7 +524,7 @@ function DayBlock({ idx, dayIdx, day, canRemove }) {
 // piling up. Override via NAUTICAI_UI_PARALLEL on window if you ever
 // want to push it.
 const MAX_PARALLEL_IMAGES =
-  Number(typeof window !== 'undefined' && window.NAUTICAI_UI_PARALLEL) || 4
+  Number(typeof window !== 'undefined' && window.NAUTICAI_UI_PARALLEL) || 6
 
 function ImagesStep() {
   const r = useReport()
@@ -518,11 +534,75 @@ function ImagesStep() {
   // an item leaves the queue.
   const [batchTotal, setBatchTotal] = useState(0)
   const [batchDone, setBatchDone] = useState(0)
+  const [batchHull, setBatchHull] = useState(0)
+  const [batchCover, setBatchCover] = useState(0)
   // Tracks ids currently processing. Lives in a ref so updates don't
   // cause renders; the auto-dispatch effect re-runs whenever `staging`
   // changes (item flips to analyzing/done/error), which is sufficient
   // to refill freed slots.
   const inFlightRef = useRef(new Set())
+  const ocrAppliedRef = useRef(false)
+  const ocrSweepRef = useRef([])       // fallback: largest images
+  const ocrPriorityRef = useRef([])    // first + last uploads (common nameplate position)
+
+  const trackForOcrSweep = (file) => {
+    if (!file?.type?.startsWith('image/')) return
+    const list = [...ocrSweepRef.current, file]
+    list.sort((a, b) => (b.size || 0) - (a.size || 0))
+    ocrSweepRef.current = list.slice(0, 8)
+  }
+
+  const trackOcrPriority = (files) => {
+    const imgs = files.filter((f) => f?.type?.startsWith('image/'))
+    if (!imgs.length) return
+    const head = imgs.slice(0, 3)
+    const tail = imgs.length > 3 ? imgs.slice(-3) : []
+    const merged = [...head, ...tail]
+    const seen = new Set()
+    ocrPriorityRef.current = merged.filter((f) => {
+      const k = f.name + f.size
+      if (seen.has(k)) return false
+      seen.add(k)
+      return true
+    })
+  }
+
+  const ocrSweepOrder = () => {
+    const seen = new Set()
+    const out = []
+    for (const f of [...ocrPriorityRef.current, ...ocrSweepRef.current]) {
+      const k = f.name + (f.size || 0)
+      if (seen.has(k)) continue
+      seen.add(k)
+      out.push(f)
+    }
+    return out.slice(0, 12)
+  }
+
+  const finalizeBatchVesselOcr = async () => {
+    const ok = await r.autoDetectVesselFromUpload()
+    if (ok) return true
+    const coverId = r.vesselImageId?.trim()
+    if (coverId) {
+      const synced = await r.syncVesselOcrFromServer(coverId, { refresh: true })
+      return synced || r.ensureVesselCover(true)
+    }
+    for (const file of ocrSweepOrder().slice(0, 8)) {
+      try {
+        const ocr = await ocrVessel(file, { persist: true })
+        r.pushOcrCandidate({ vessel_ocr: ocr, image_id: ocr.image_id })
+      } catch { /* try next */ }
+    }
+    return r.autoDetectVesselFromUpload() || r.ensureVesselCover(true)
+  }
+
+  const considerVesselOcr = (result) => {
+    if (isCoverOnlyResult(result) && result?.image_id) {
+      r.applyCoverFromAnalyze(result)
+      return
+    }
+    r.pushOcrCandidate(result)
+  }
 
   const counts = useMemo(() => {
     let imgs = 0, frames = 0, videos = 0
@@ -540,12 +620,40 @@ function ImagesStep() {
   // is in flight) — gives the user a clean "0 / 0" between batches.
   useEffect(() => {
     if (staging.length === 0 && batchDone >= batchTotal && batchTotal > 0) {
-      const t = setTimeout(() => { setBatchTotal(0); setBatchDone(0) }, 4000)
+      ;(async () => {
+        if (!ocrAppliedRef.current) {
+          const ok = await finalizeBatchVesselOcr()
+          if (ok) {
+            ocrAppliedRef.current = true
+            const name = r.vessel.vesselName
+            const conf = r.vesselOcrConfidence
+            toast.success(
+              `Vessel ${name} (${(conf * 100).toFixed(0)}% OCR) — name & cover linked`,
+            )
+          }
+        }
+      })()
+      const t = setTimeout(() => {
+        setBatchTotal(0)
+        setBatchDone(0)
+        setBatchHull(0)
+        setBatchCover(0)
+      }, 4000)
       return () => clearTimeout(t)
     }
   }, [staging.length, batchDone, batchTotal])
 
+  useEffect(() => {
+    if (batchTotal === 0) {
+      ocrAppliedRef.current = false
+      ocrSweepRef.current = []
+      ocrPriorityRef.current = []
+    }
+  }, [batchTotal])
+
   const addFiles = (files) => {
+    trackOcrPriority(files)
+    files.forEach(trackForOcrSweep)
     const next = files.map((file) => ({
       id: crypto.randomUUID(),
       file,
@@ -584,22 +692,12 @@ function ImagesStep() {
     try {
       if (it.kind === 'image') {
         const result = await analyzeImage(it.file)
-        // Whole-ship overview shots are auto-detected — keep them on the
-        // report only as the vessel cover photo (so they appear on the
-        // Photographic Report opener) and never inside a hull-region grid.
-        if (result.is_overview) {
-          if (!r.vesselImageId) r.setVesselImageId(result.image_id)
-          // Auto-OCR runs server-side for overview shots — adopt the
-          // detected vessel name so the Vessel & Job step is pre-filled.
-          const guess = result.vessel_ocr?.best_guess
-          if (guess && !r.vessel.vesselName) {
-            r.updateVessel({ vesselName: guess })
-            toast.success(`Vessel name detected: ${guess}`)
-          } else {
-            toast(`${it.name} looks like a whole-ship photo — set as cover, ` +
-                  'not added to a hull region.', { icon: 'ℹ️' })
-          }
+        considerVesselOcr(result)
+        // Cover / whole-ship / nameplate → Photographic Report OCR (not hull grids).
+        if (isCoverOnlyResult(result)) {
+          setBatchCover((n) => n + 1)
         } else {
+          setBatchHull((n) => n + 1)
           r.addAnalyzedImage(result.region.id, {
             file: it.file,
             url: it.url,
@@ -622,8 +720,10 @@ function ImagesStep() {
           data.frames.map((f) => fetchImageObjectUrl(f.image_id)),
         )
         data.frames.forEach((f, i) => {
-          // Skip overview frames — they pollute the per-region grids.
-          if (f.is_overview) return
+          if (isCoverOnlyResult(f)) {
+            considerVesselOcr(f)
+            return
+          }
           r.addAnalyzedImage(f.region.id, {
             url: thumbs[i],
             name: `${it.name} · t=${f.ts_sec.toFixed(1)}s`,
@@ -634,19 +734,7 @@ function ImagesStep() {
             source_filename: it.name,
           })
         })
-        // If the auto-OCR found a vessel name and the user hasn't set one yet, fill it in.
-        const guess = data.vessel_ocr?.best_guess
-        if (guess && !r.vessel.vesselName) {
-          r.updateVessel({ vesselName: guess })
-          toast.success(`Vessel name detected: ${guess}`)
-        }
-        // Always adopt the sharpest video frame as the report's cover photo
-        // when no cover is set yet — even if OCR couldn't read a name from
-        // it. This guarantees the PDF's "PHOTOGRAPHIC REPORT" opener page
-        // has an image. The user can still override via the OCR card.
-        if (data.vessel_ocr?.image_id && !r.vesselImageId) {
-          r.setVesselImageId(data.vessel_ocr.image_id)
-        }
+        if (isCoverOnlyResult(data)) considerVesselOcr(data)
       }
       setStaging((p) => p.filter((x) => x.id !== id))  // success → remove from staging
       setBatchDone((n) => n + 1)
@@ -734,10 +822,9 @@ function ImagesStep() {
           <div>
             <h3 className="font-display font-semibold text-white">Drop everything from the dive</h3>
             <p className="text-sm text-slate-400 max-w-2xl">
-              Photos, ROV videos, or the whole dive-day folder — NautiCAI auto-routes each
-              into its hull region (Bow, Propeller, Bilge Keels, …), tags the fouling species,
-              and reads the vessel name straight off any whole-ship shot. Continue to the
-              next step while analysis runs in the background.
+              Drop the full dive folder. Models route hull vs cover; OCR links the vessel name
+              and Photographic Report photo. On any hull photo, hover and click the image icon
+              to set the PDF cover, or use Re-detect on step 2 (Vessel & Job).
             </p>
           </div>
         </div>
@@ -748,7 +835,15 @@ function ImagesStep() {
               Analysing {batchDone} / {batchTotal} ({progressPct}%)
             </span>
           )}
-          {counts.imgs > 0 && <span className="pill-mute">{counts.imgs} photos routed</span>}
+          {batchHull > 0 && (
+            <span className="pill-mute">{batchHull} hull · {batchCover} cover</span>
+          )}
+          {counts.imgs > 0 && batchHull === 0 && (
+            <span className="pill-mute">{counts.imgs} hull photos routed</span>
+          )}
+          {counts.imgs > 0 && batchHull > 0 && (
+            <span className="pill-mute">{counts.imgs} in grids</span>
+          )}
           {counts.frames > 0 && <span className="pill-mute"><Film size={10} /> {counts.frames} frames</span>}
           {counts.staged > 0 && <span className="pill-warn">{counts.staged} in queue</span>}
         </div>
@@ -768,7 +863,12 @@ function ImagesStep() {
                 ? <>Background analysis &mdash; feel free to move on to the next step.</>
                 : <>All photos processed.</>}
             </span>
-            <span className="font-mono text-slate-300">{batchDone} / {batchTotal}</span>
+            <span className="font-mono text-slate-300">
+              {batchDone} / {batchTotal}
+              {batchDone > 0 && (
+                <> · {batchHull} hull · {batchCover} cover</>
+              )}
+            </span>
           </div>
         </div>
       )}
@@ -896,37 +996,59 @@ function RoutedRegion({ region, items }) {
 function RoutedCard({ item, region, onRemove, onMove }) {
   const r = useReport()
   const [override, setOverride] = useState(false)
+  const isReportCover = Boolean(item.backendId && r.vesselImageId === item.backendId)
 
-  // Promote a photo the model mis-classified as a hull region into the
-  // vessel cover slot (used on the PHOTOGRAPHIC REPORT opener page).
-  // Removes it from this region so it never appears in the per-region
-  // grid below.
-  const useAsCover = () => {
+  const useAsCover = async (removeFromRegion = false) => {
     if (!item.backendId) {
       toast.error('This photo has no backend id yet — wait for analysis.')
       return
     }
+    if (item.result?.vessel_ocr) {
+      r.pushOcrCandidate({ image_id: item.backendId, vessel_ocr: item.result.vessel_ocr })
+    }
     r.setVesselImageId(item.backendId)
-    r.removeImage(region.id, item.id)
+    await r.syncVesselOcrFromServer(item.backendId, { refresh: true })
+    if (removeFromRegion) {
+      r.removeImage(region.id, item.id)
+    }
     setOverride(false)
-    toast.success('Set as the vessel cover photo for the report.')
+    const name = (r.vessel.vesselName || '').trim()
+    toast.success(
+      name
+        ? `Photographic cover: ${name}`
+        : 'Photographic Report will use this photo on the cover page.',
+    )
   }
 
   return (
-    <div className="group relative overflow-hidden rounded-xl border border-white/10 bg-ink-900">
+    <div className={`group relative overflow-hidden rounded-xl border bg-ink-900 transition ${
+      isReportCover ? 'border-brand-400/60 ring-1 ring-brand-400/30' : 'border-white/10'
+    }`}>
       <img src={item.url} alt={item.name}
            className="aspect-square w-full object-cover transition group-hover:scale-105" />
       <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-ink-950 via-ink-950/40 to-transparent" />
 
-      {item.kind === 'frame' && (
+      {isReportCover && (
+        <div className="absolute left-2 top-2 z-[1]">
+          <span className="pill-brand text-[10px]"><ImageIcon size={9} /> PDF cover</span>
+        </div>
+      )}
+      {item.kind === 'frame' && !isReportCover && (
         <div className="absolute left-2 top-2">
           <span className="pill-brand text-[10px]"><Film size={9} /> frame</span>
         </div>
       )}
       <div className="absolute right-2 top-2 flex gap-1 opacity-0 transition group-hover:opacity-100">
+        <button
+          type="button"
+          onClick={() => useAsCover(false)}
+          className="rounded-lg bg-ink-900/80 p-1.5 text-emerald-300 hover:bg-ink-800"
+          title="Use as Photographic Report cover (keeps photo in this region)">
+          <ImageIcon size={13} />
+        </button>
         <button onClick={() => setOverride((v) => !v)}
                 className="rounded-lg bg-ink-900/80 p-1.5 text-brand-300 hover:bg-ink-800"
-                title="Move or use as vessel cover">
+                title="Move region or remove from grid for cover">
           <Wand2 size={13} />
         </button>
         <button onClick={onRemove}
@@ -947,9 +1069,13 @@ function RoutedCard({ item, region, onRemove, onMove }) {
                 <option key={r.id} value={r.id} className="bg-ink-900">{r.displayLabel}</option>
               ))}
             </select>
-            <button onClick={useAsCover}
+            <button type="button" onClick={() => useAsCover(false)}
                     className="btn-outline text-[10px] w-full inline-flex items-center justify-center gap-1">
-              <ImageIcon size={11} /> Use as vessel cover photo
+              <ImageIcon size={11} /> Set as PDF cover (keep in region)
+            </button>
+            <button type="button" onClick={() => useAsCover(true)}
+                    className="btn-ghost text-[10px] w-full inline-flex items-center justify-center gap-1 text-slate-300">
+              <ImageIcon size={11} /> Set as PDF cover only (remove from grid)
             </button>
             <button onClick={() => setOverride(false)} className="btn-ghost text-[10px] w-full">Cancel</button>
           </div>
@@ -961,7 +1087,11 @@ function RoutedCard({ item, region, onRemove, onMove }) {
         <div className="mt-1 flex flex-wrap gap-1">
           {item.result && (
             <>
-              <span className="pill-mute">{item.result.stage?.id}</span>
+              <span className="pill-mute">
+                {item.result.cover_only || item.result.stage?.id === 'not_hull'
+                  ? 'cover'
+                  : item.result.stage?.id}
+              </span>
               <span className="pill-warn">{Math.round(item.result.fouling_pct)}%</span>
               <span className="pill-brand">{item.result.species?.top_display || item.result.species?.top}</span>
             </>
@@ -988,6 +1118,7 @@ function FindingsStep() {
 
   return (
     <div className="space-y-4">
+      <PhotographicCoverPanel compact />
       <div className="glass rounded-2xl p-4 text-sm text-slate-300">
         <span className="text-brand-300 font-semibold">Tip:</span> The AI fills the fouling
         section automatically. Use the form below to add the surveyor's manual notes (damage,
@@ -1219,17 +1350,26 @@ function ReviewStep({ busy, onAnalyzeAll, onGenerate }) {
   const totals = HULL_REGIONS.map((region) => {
     const items = r.images[region.id] || []
     const done = items.filter((i) => i.status === 'done')
-    const before = done.filter((i) => i.result?.stage?.id === 'before')
-    const after  = done.filter((i) => i.result?.stage?.id === 'after')
+    const hullDone = done.filter(
+      (i) => !i.result?.cover_only && i.result?.stage?.id !== 'not_hull',
+    )
+    const before = hullDone.filter((i) => i.result?.stage?.id === 'before')
+    const after  = hullDone.filter((i) => i.result?.stage?.id === 'after')
+    const cover  = done.filter(
+      (i) => i.result?.cover_only || i.result?.stage?.id === 'not_hull',
+    )
     const avg = done.length
       ? done.reduce((s, i) => s + (i.result?.fouling_pct || 0), 0) / done.length
       : 0
     const findings = r.regionInspections[region.id]
-    return { region, items, done, before, after, avg, findings }
+    return { region, items, done, hullDone, before, after, cover, avg, findings }
   }).filter((t) => t.items.length)
 
   return (
-    <div className="grid lg:grid-cols-3 gap-4">
+    <div className="space-y-4">
+      <PhotographicCoverPanel compact />
+
+      <div className="grid lg:grid-cols-3 gap-4">
       <div className="glass rounded-2xl p-5 lg:col-span-2">
         <div className="flex items-center justify-between gap-3">
           <h3 className="font-display font-semibold text-white flex items-center gap-2">
@@ -1282,25 +1422,24 @@ function ReviewStep({ busy, onAnalyzeAll, onGenerate }) {
         <h3 className="font-display font-semibold text-white">Vessel Summary</h3>
         <dl className="mt-3 space-y-2 text-sm">
           {Object.entries(r.vessel)
-            .filter(([k, v]) => k !== 'extra' && v !== '')
+            .filter(([k, v]) => k !== 'extra' && v !== '' && v != null
+              && !(Array.isArray(v) && v.length === 0))
             .map(([k, v]) => (
               <div key={k} className="flex items-start justify-between gap-3 border-b border-white/5 pb-2 last:border-none">
-                <dt className="text-xs uppercase tracking-wider text-slate-400">{k}</dt>
+                <dt className="text-xs uppercase tracking-wider text-slate-400">
+                  {k.replace(/_/g, ' ')}
+                </dt>
                 <dd className="text-right text-slate-200 max-w-[55%] break-words">
-                  {String(v)}
+                  {formatVesselSummaryValue(k, v)}
                 </dd>
               </div>
             ))}
         </dl>
-        {r.vesselImageId && (
-          <div className="mt-3 text-[11px] text-emerald-300/90">
-            ● Vessel photograph attached
-          </div>
-        )}
         <button className="btn-primary mt-4 w-full" onClick={onGenerate} disabled={busy}>
           {busy ? <Loader2 size={16} className="animate-spin" /> : <FileDown size={16} />}
           Generate Report PDF
         </button>
+      </div>
       </div>
     </div>
   )

@@ -23,8 +23,13 @@ except Exception: pass
 
 from backend import config                              # noqa: E402
 from backend.inference import region, before_after, species, ocr  # noqa: E402
+from backend.inference import _runtime as inf_runtime   # noqa: E402
+from backend.services.analyze import _serial_inference  # noqa: E402
 
-print(f"== device={config.DEVICE}  ocr_gpu={config.OCR_GPU} ==")
+print(f"== device={config.DEVICE}  backend={inf_runtime._FORCE}  ocr_gpu={config.OCR_GPU} ==")
+for ckpt in (config.SHIP_REGION_CKPT, config.BEFORE_AFTER_CKPT, config.SPECIES_CKPT):
+    ch = inf_runtime.resolve(ckpt)
+    print(f"   {ckpt.name:40s} -> {ch.backend} ({ch.reason})")
 try:
     import torch
     if torch.cuda.is_available():
@@ -59,21 +64,38 @@ _bench("species",       lambda: species.predict(img))
 from concurrent.futures import ThreadPoolExecutor
 pool = ThreadPoolExecutor(max_workers=3)
 
-def seq():
-    region.predict(img); before_after.predict(img); species.predict(img)
+def run_three(_img=img):
+    region.predict(_img); before_after.predict(_img); species.predict(_img)
 
-def par():
-    f1 = pool.submit(region.predict, img)
-    f2 = pool.submit(before_after.predict, img)
-    f3 = pool.submit(species.predict, img)
+def run_three_parallel(_img=img):
+    f1 = pool.submit(region.predict, _img)
+    f2 = pool.submit(before_after.predict, _img)
+    f3 = pool.submit(species.predict, _img)
     f1.result(); f2.result(); f3.result()
 
 print("\nThree-model combo (one /api/analyze call):")
-_bench("seq 3 models",  seq, runs=3)
-if config.DEVICE == "cuda":
-    print("  (parallel 3-model skipped on CUDA — Jetson TRT must run serial)")
+_bench("seq 3 models",  run_three, runs=3)
+if _serial_inference():
+    print("  (parallel skipped — TRT or dual native-PyTorch on CUDA)")
 else:
-    _bench("par 3 models",  par, runs=3)
+    _bench("par 3 models",  run_three_parallel, runs=3)
+
+# Real dive photos (BW Birch reference set)
+_birch = sorted((Path(__file__).resolve().parent / "assets/birch_reference/extracted").glob("*.jpg"))
+if _birch:
+    n = min(20, len(_birch))
+    sample = _birch[:n]
+    print(f"\nBatch over {n} birch photos ({sample[0].name} …):")
+    t0 = time.perf_counter()
+    for p in sample:
+        run_three(Image.open(p).convert("RGB"))
+    ms = (time.perf_counter() - t0) / n * 1000
+    print(f"  seq 3 models / image   avg={ms:7.1f} ms  ({1000/ms:.1f} img/s)")
+    t0 = time.perf_counter()
+    for p in sample:
+        run_three_parallel(Image.open(p).convert("RGB"))
+    ms = (time.perf_counter() - t0) / n * 1000
+    print(f"  par 3 models / image   avg={ms:7.1f} ms  ({1000/ms:.1f} img/s)")
 
 # OCR
 import tempfile, os

@@ -47,10 +47,76 @@ class AnalyzeResult(BaseModel):
     is_overview: bool = False  # True if filtered out as a whole-ship cover shot
 
 
+class VesselResolution(BaseModel):
+    """OCR matched to company fleet or flagged as new vessel."""
+    display_name: str = ""
+    match_kind: str = ""       # auto | exact | fuzzy | discovery | no_nameplate | pinned | conflict
+    confidence: float = 0.0
+    score: float = 0.0
+    raw_ocr: str = ""
+    registry_id: Optional[str] = None
+    needs_review: bool = False
+    review_reason: str = ""
+    alternatives: List[Dict[str, Any]] = Field(default_factory=list)
+
+
 class VesselOcrResult(BaseModel):
-    candidates: List[OcrLine]
-    best_guess: str
-    best_confidence: float
+    candidates: List[OcrLine] = Field(default_factory=list)
+    best_guess: str = ""
+    best_confidence: float = 0.0
+    image_id: Optional[str] = None
+    vessel_resolution: Optional[VesselResolution] = None
+
+
+# ---------------- Vessels directory ----------------------------------------
+class VesselCreate(BaseModel):
+    name: str = Field(..., min_length=1)
+    aliases: List[str] = Field(default_factory=list)
+    imo_number: str = ""
+    notes: str = ""
+
+
+class VesselRow(VesselCreate):
+    id: str
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class VesselSuggestRequest(BaseModel):
+    image_ids: List[str] = Field(default_factory=list)
+    pinned_vessel_name: str = ""
+
+
+class CoverAlternateRow(BaseModel):
+    """One nameplate / whole-ship photo and the OCR vessel name read from it."""
+    image_id: str
+    display_name: str = ""
+    confidence: float = 0.0
+    score: float = 0.0
+    raw_ocr: str = ""
+    matches_best_name: bool = False
+    likely_truncated: bool = False
+
+
+class VesselSuggestResponse(BaseModel):
+    display_name: str = ""
+    match_kind: str = ""
+    confidence: float = 0.0
+    score: float = 0.0
+    raw_ocr: str = ""
+    registry_id: Optional[str] = None
+    needs_review: bool = False
+    review_reason: str = ""
+    cover_image_id: Optional[str] = None
+    cover_alternates: List[CoverAlternateRow] = Field(default_factory=list)
+
+
+class CoverAlternatesResponse(BaseModel):
+    cover_alternates: List[CoverAlternateRow] = Field(default_factory=list)
+    total: int = 0
 
 
 # ---------------- Clients directory --------------------------------------

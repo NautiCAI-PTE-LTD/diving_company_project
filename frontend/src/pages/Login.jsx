@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Link, useNavigate, useLocation } from 'react-router-dom'
+import { Link } from 'react-router-dom'
 import { Mail, Lock, Loader2, ArrowRight, Anchor } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { login } from '../lib/api'
@@ -8,8 +8,6 @@ import { useBrand } from '../store/brandStore'
 import AuthLayout from '../components/AuthLayout'
 
 export default function Login() {
-  const nav = useNavigate()
-  const loc = useLocation()
   const setSession = useAuth((s) => s.setSession)
   const refreshBrand = useBrand((s) => s.refresh)
 
@@ -28,8 +26,7 @@ export default function Login() {
       setSession({ token: r.access_token, user: r.user, company: r.company })
       await refreshBrand()
       toast.success(`Welcome back, ${r.user.full_name || r.user.email}`)
-      const target = loc.state?.from?.pathname || '/'
-      nav(target, { replace: true })
+      // AuthGate validates the session and switches to the main app (no manual nav).
     } catch (err) {
       toast.error(err?.response?.data?.detail || 'Sign in failed')
     } finally { setBusy(false) }

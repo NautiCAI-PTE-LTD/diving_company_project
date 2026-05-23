@@ -7,6 +7,54 @@ export const api = axios.create({
   timeout: 120_000,
 })
 
+/** Turn API errors into a short message (handles blob 404 bodies from PDF routes). */
+export async function apiErrorMessage(err) {
+  const raw = err?.response?.data
+  if (!raw) {
+    if (/network|ECONNREFUSED|ERR_CONNECTION/i.test(err?.message || '')) {
+      return 'Cannot reach the API — start the backend on http://127.0.0.1:8000'
+    }
+    return err?.message || String(err)
+  }
+  if (typeof raw === 'string') return raw
+  if (raw?.detail) {
+    const d = raw.detail
+    return typeof d === 'string' ? d : JSON.stringify(d)
+  }
+  if (typeof Blob !== 'undefined' && raw instanceof Blob) {
+    try {
+      const text = await raw.text()
+      const j = JSON.parse(text)
+      return j.detail || text
+    } catch {
+      return err?.message || 'Request failed'
+    }
+  }
+  return err?.message || String(err)
+}
+
+/** True when the FastAPI backend answers /api/health. */
+export async function checkBackendOnline() {
+  try {
+    const { data } = await api.get('/health', { timeout: 5000 })
+    return Boolean(data?.ok)
+  } catch {
+    return false
+  }
+}
+
+/** User-friendly text when detail is the generic Starlette 404. */
+export function friendlyApiDetail(detail, fallback = 'Request failed') {
+  const d = (detail || '').trim()
+  if (!d || d === 'Not Found') {
+    return 'API not reachable — start backend: python -m uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000'
+  }
+  if (d === 'image not found' || d === 'image file missing') {
+    return 'Photo not on server — re-upload on Upload Raw Data and wait until analysis finishes'
+  }
+  return d
+}
+
 // Attach Bearer token to every outgoing request.
 api.interceptors.request.use((cfg) => {
   const token = useAuth.getState().token
@@ -14,12 +62,19 @@ api.interceptors.request.use((cfg) => {
   return cfg
 })
 
-// Auto-logout on 401.
+// Auto-logout on 401 and return to the login screen.
 api.interceptors.response.use(
   (r) => r,
   (err) => {
     if (err?.response?.status === 401) {
+      const path = window.location.pathname
+      const url = err?.config?.url || ''
+      const onAuthScreen = path === '/login' || path === '/register'
+      const duringBootCheck = url.includes('/auth/me')
       try { useAuth.getState().logout() } catch { /* noop */ }
+      if (!onAuthScreen && !duringBootCheck) {
+        window.location.replace('/login')
+      }
     }
     return Promise.reject(err)
   },
@@ -126,8 +181,20 @@ export async function ocrVessel(file, { persist = false } = {}) {
 }
 
 // ---------------------------------------------------------------- reports ----
-export async function createReport({ vessel, image_ids = [] }) {
-  const { data } = await api.post('/reports', { vessel, image_ids })
+export async function createReport({
+  vessel,
+  image_ids = [],
+  region_inspections = {},
+  vessel_image_id = '',
+  client_id = null,
+} = {}) {
+  const { data } = await api.post('/reports', {
+    vessel,
+    image_ids,
+    region_inspections,
+    vessel_image_id: vessel_image_id || '',
+    client_id,
+  })
   return data
 }
 
@@ -153,7 +220,7 @@ export async function deleteReport(id) {
 
 export async function generateReportPdf(id) {
   const { data } = await api.post(`/reports/${id}/generate`, null, {
-    timeout: 600_000,   // PDF rendering with many images can take a while
+    timeout: 900_000,   // PDF rendering with many images can take a while
   })
   return data
 }
@@ -167,7 +234,7 @@ export function reportPdfDownloadUrl(id) {
  *  pull the blob ourselves. */
 export async function downloadReportPdf(id, vesselName = '') {
   const { data, headers } = await api.get(`/reports/${id}/pdf`, {
-    responseType: 'blob', timeout: 120_000,
+    responseType: 'blob', timeout: 900_000,
   })
   const safe = (vesselName || id).replace(/[^A-Za-z0-9_\-]+/g, '_').slice(0, 60)
   const filename =
@@ -183,12 +250,27 @@ export async function downloadReportPdf(id, vesselName = '') {
 /** Open the PDF in a new tab. Same auth dance — fetch as blob then open the
  *  object URL so the browser opens it inline. */
 export async function openReportPdf(id) {
-  const { data } = await api.get(`/reports/${id}/pdf`, {
-    responseType: 'blob', timeout: 120_000,
-  })
-  const url = URL.createObjectURL(data)
-  window.open(url, '_blank', 'noopener,noreferrer')
-  setTimeout(() => URL.revokeObjectURL(url), 60_000)
+  try {
+    const { data, headers } = await api.get(`/reports/${id}/pdf`, {
+      responseType: 'blob', timeout: 900_000,
+    })
+    const ct = (headers?.['content-type'] || '').toLowerCase()
+    if (ct.includes('json') || (data?.type || '').includes('json')) {
+      const text = await data.text()
+      let detail = text
+      try { detail = JSON.parse(text).detail || text } catch { /* keep text */ }
+      throw new Error(friendlyApiDetail(detail, 'PDF not available'))
+    }
+    if (!data?.size) {
+      throw new Error('PDF file is empty — try Generate PDF again from Reports.')
+    }
+    const url = URL.createObjectURL(data)
+    window.open(url, '_blank', 'noopener,noreferrer')
+    setTimeout(() => URL.revokeObjectURL(url), 60_000)
+  } catch (err) {
+    const msg = await apiErrorMessage(err)
+    throw new Error(friendlyApiDetail(msg, msg))
+  }
 }
 
 // ---------------------------------------------------------------- images ----
@@ -252,10 +334,41 @@ export async function fetchLogoObjectUrl() {
 /** Fetch a protected image (e.g. an extracted video frame) and turn it into
  *  an `<img src>`-friendly blob URL.  Returns '' on failure. */
 export async function fetchImageObjectUrl(imageId) {
+  if (!imageId?.trim()) return ''
   try {
     const { data } = await api.get(`/images/${imageId}/file`, { responseType: 'blob' })
+    if (!data?.size) return ''
     return URL.createObjectURL(data)
   } catch {
     return ''
   }
+}
+
+/** Automated vessel name + cover from analysed image ids (no manual vessel list). */
+export async function autoDetectVessel(imageIds, { pinnedVesselName = '' } = {}) {
+  const { data } = await api.post('/vessels/auto-detect', {
+    image_ids: imageIds,
+    pinned_vessel_name: pinnedVesselName || '',
+  })
+  return data
+}
+
+/** All nameplate photos in the batch with OCR names (for "Try next nameplate"). */
+export async function fetchCoverAlternates(imageIds, { refreshOcr = false } = {}) {
+  const { data } = await api.post('/vessels/cover-alternates', {
+    image_ids: imageIds,
+    pinned_vessel_name: '',
+  }, {
+    params: refreshOcr ? { refresh: true } : {},
+    timeout: 600_000,
+  })
+  return data
+}
+
+/** Re-read vessel name OCR for an uploaded image (fixes stale VERSTONE-style guesses). */
+export async function fetchImageVesselOcr(imageId, { refresh = true } = {}) {
+  const { data } = await api.get(`/images/${imageId}/vessel-ocr`, {
+    params: refresh ? { refresh: true } : {},
+  })
+  return data
 }

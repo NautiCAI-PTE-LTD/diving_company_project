@@ -1,0 +1,19 @@
+# GPU cloud inference (GCP L4, GCE A10, Oracle GPU, etc.)
+# Install after base requirements:
+#   pip install -r backend/requirements.txt -r backend/requirements-gpu.txt
+#
+# On Ubuntu 22.04 + NVIDIA driver 535+ / CUDA 12.x:
+
+-r requirements.txt
+
+# ONNX Runtime with CUDA (Linux production — replaces CPU onnxruntime wheel)
+onnxruntime-gpu>=1.18.0
+
+# TensorRT engines (optional but fastest on L4 — also needs system TensorRT + pycuda)
+# Install TensorRT from NVIDIA repo for your CUDA version, then:
+#   pip install nvidia-tensorrt pycuda
+# Or use only ONNX CUDA without building .engine files.
+
+# ONNX export / TRT build helpers (run on the GPU VM once)
+onnx>=1.16.0
+onnxscript>=0.1.0

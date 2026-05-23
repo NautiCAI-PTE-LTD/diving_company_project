@@ -80,6 +80,7 @@ class Company(Base):
     reports = relationship("Report", back_populates="company", cascade="all, delete-orphan")
     images  = relationship("Image",  back_populates="company", cascade="all, delete-orphan")
     clients = relationship("Client", back_populates="company", cascade="all, delete-orphan")
+    vessels = relationship("Vessel", back_populates="company", cascade="all, delete-orphan")
 
 
 class User(Base):
@@ -129,6 +130,26 @@ class Client(Base):
 
     __table_args__ = (
         Index("ix_clients_company_id_name", "company_id", "name"),
+    )
+
+
+class Vessel(Base):
+    """Company vessel directory — canonical names + OCR aliases (Silverstone, Patris, …)."""
+    __tablename__ = "vessels"
+    id         = Column(String, primary_key=True, default=_uid)
+    company_id = Column(String, ForeignKey("companies.id", ondelete="CASCADE"),
+                         index=True, nullable=False)
+    name       = Column(String, nullable=False)
+    aliases    = Column(JSON, default=list)   # ["SILVERSTONE", "SS SILVERSTONE"]
+    imo_number = Column(String, default="")
+    notes      = Column(Text, default="")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    company = relationship("Company", back_populates="vessels")
+
+    __table_args__ = (
+        Index("ix_vessels_company_id_name", "company_id", "name"),
     )
 
 

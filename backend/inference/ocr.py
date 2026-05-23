@@ -49,6 +49,53 @@ def _alphabet_purity(s: str) -> float:
     return letters / len(s)
 
 
+_REGISTRY_MARKS = frozenset({
+    "MONROVIA", "LIBERIA", "PANAMA", "MALTA", "HAMILTON", "NASSAU", "BAHAMAS",
+    "SINGAPORE", "HONGKONG", "CYPRUS", "MARSHALL", "MAJURO", "ISLE", "MAN",
+})
+
+
+def _guess_quality(text: str, conf: float) -> float:
+    g = _normalise(text)
+    if not g or conf <= 0:
+        return 0.0
+    score = float(conf)
+    n = len(g)
+    if g in _REGISTRY_MARKS:
+        score *= 0.12
+    elif n >= 6:
+        score *= 1.05
+    return min(score, 1.0)
+
+
+def _share_suffix(a: str, b: str, n: int = 5) -> bool:
+    na, nb = _normalise(a), _normalise(b)
+    if not na or not nb:
+        return False
+    k = min(n, len(na), len(nb))
+    return na[-k:] == nb[-k:]
+
+
+def _pick_vessel_name_line(candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Prefer the main painted name over port-of-registry lines (e.g. MONROVIA)."""
+    if not candidates:
+        return None
+    pool = [c for c in candidates if c["text"] not in _REGISTRY_MARKS]
+    pool = pool or list(candidates)
+    for c in pool:
+        c["_quality"] = _guess_quality(c["text"], c["confidence"])
+    pool.sort(key=lambda c: -c["_quality"])
+    top = pool[0]["_quality"]
+    tier = [c for c in pool if c["_quality"] >= top * 0.82]
+    tier.sort(key=lambda c: (-len(c["text"]), -c["_quality"]))
+    best = tier[0] if tier else pool[0]
+    for pick in pool:
+        if len(pick["text"]) > len(best["text"]) and _share_suffix(pick["text"], best["text"]):
+            if pick["_quality"] >= best["_quality"] * 0.65:
+                best = pick
+    return best
+
+
 def _looks_like_vessel_name(s: str) -> bool:
     s = s.strip()
     if len(s) < 3 or len(s) > 30:
@@ -209,7 +256,7 @@ def extract(pil_img: Image.Image) -> Dict[str, Any]:
         })
 
     candidates.sort(key=lambda r: -r["score"])
-    best = candidates[0] if candidates else None
+    best = _pick_vessel_name_line(candidates)
     return {
         "candidates": [
             {"text": c["text"], "confidence": c["confidence"], "box": c["box"]}

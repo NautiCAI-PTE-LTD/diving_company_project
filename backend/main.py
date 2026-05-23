@@ -26,18 +26,25 @@ from PIL import Image as PILImage
 
 from . import config
 from . import auth as auth_svc
-from .db import init_db, db_session, Report, Image as ImageRow, Company, User, Client
+from .db import init_db, db_session, Report, Image as ImageRow, Company, User, Client, Vessel
 from .schemas import (
     VesselInfo, ReportCreate, ReportPatch, ReportRow,
     StatsResponse, SettingsModel,
     RegisterPayload, LoginPayload, AuthResponse, UserOut,
     ClientCreate, ClientRow,
+    VesselCreate, VesselRow, VesselSuggestRequest, VesselSuggestResponse,
+    CoverAlternatesResponse, CoverAlternateRow,
 )
 from .services import storage as storage_svc
 from .services import analyze as analyze_svc
 from .services import cluster as cluster_svc
-from .services import pdf_report as pdf_svc
+from . import config as app_config
+from .services import pdf_report as pdf_report_marine
+from .services import pdf_report_uw
 from .services import video as video_svc
+from .services import vessel_discovery as vessel_disc
+from .services import vessel_registry as vessel_reg
+from .services import vessel_auto as vessel_auto_svc
 from .inference import ocr as ocr_inference
 
 logging.basicConfig(level=logging.INFO,
@@ -83,18 +90,22 @@ def _warmup_models() -> None:
     _WARMUP_STATE["status"] = "warming"
     try:
         from .inference import region as r_, before_after as b_, species as s_
+        from .inference import ocr as ocr_
         # touch each model's lazy loader
         r_.class_names()
+        from . import species_registry as species_reg
+        species_reg.sync_config()
         s_.class_names()
-        # before/after has no public list-helper; calling predict on a
-        # tiny dummy image is the cheapest way to force its weights to load
+        log.info("Species classes: %s", ", ".join(species_reg.load_class_names()))
         from PIL import Image as _PI
         dummy = _PI.new("RGB", (224, 224), (0, 0, 0))
         b_.predict(dummy)
-        # Burn one forward pass through each Torch model so cuDNN picks
-        # its fastest kernel and FP16 paths are JIT-compiled.
         r_.predict(dummy)
         s_.predict(dummy)
+        try:
+            ocr_._load()
+        except Exception:
+            log.debug("OCR warmup skipped", exc_info=True)
         _WARMUP_STATE["status"] = "ready"
         log.info("Models warmed up · device=%s", config.DEVICE)
     except Exception as e:
@@ -106,6 +117,11 @@ def _warmup_models() -> None:
 @app.on_event("startup")
 def _startup() -> None:
     init_db()
+    try:
+        from . import species_registry as species_reg
+        species_reg.sync_config()
+    except Exception:
+        log.debug("species registry sync skipped", exc_info=True)
     log.info("NautiCAI backend ready · models dir = %s · device = %s",
               config.MODELS_DIR, config.DEVICE)
     # CUDA context must exist on the main thread before TRT engines load in the
@@ -277,6 +293,10 @@ def system_info():
         "ocr_gpu":  config.OCR_GPU,
         "fp16":     config.USE_FP16,
         "matmul":   config.MATMUL_PRECISION,
+        "inference_max_edge": config.INFERENCE_MAX_EDGE,
+        "analyze_concurrency": _default_analyze_concurrency(),
+        "pdf_fast": app_config.PDF_FAST,
+        "pdf_max_photos_per_stage": app_config.PDF_MAX_PHOTOS_PER_STAGE,
     }
     try:
         import torch
@@ -323,12 +343,16 @@ def meta():
             {"id": s, "display": config.SPECIES_DISPLAY.get(s, s)}
             for s in config.SPECIES
         ],
-        "stages": config.STAGES,
+        "stages": [
+            {"id": s, "display": {"before": "Before cleaning", "after": "After cleaning",
+                                   "not_hull": "Cover / not hull"}.get(s, s)}
+            for s in config.STAGES
+        ],
         "automations": [
             {"name": "Hull Zone Detector",      "desc": "Sorts photos into 11 hull regions"},
-            {"name": "Cleaning Stage Detector", "desc": "Separates before vs after cleaning"},
-            {"name": "Fouling Identifier",      "desc": "Tags algae, barnacles, macroalgae, mussels, clean paint"},
-            {"name": "Vessel-Name Reader",      "desc": "Reads the painted vessel name from a deck photo"},
+            {"name": "Cleaning Stage Detector", "desc": "Before / after / not hull (overwater rejected)"},
+            {"name": "Fouling Identifier",      "desc": "11 classes: slime, algae, grass, tubeworms, barnacles, mussels, …"},
+            {"name": "Vessel-Name Reader",      "desc": "Reads the painted vessel name from cover photos"},
         ],
     }
 
@@ -418,15 +442,24 @@ def me(user: User = Depends(auth_svc.get_current_user)):
 # still let uploads/saves happen freely. Cloud T4/L4/A10 can safely
 # raise this via NAUTICAI_ANALYZE_CONCURRENCY.
 import asyncio as _asyncio
-_ANALYZE_SEMAPHORE = _asyncio.Semaphore(
-    int(os.environ.get("NAUTICAI_ANALYZE_CONCURRENCY",
-                       "1" if config.DEVICE == "cuda" else "2"))
-)
+
+
+def _default_analyze_concurrency() -> int:
+    from .inference import _runtime as rt_
+    r = rt_.resolve(config.SHIP_REGION_CKPT)
+    s = rt_.resolve(config.SPECIES_CKPT)
+    return config.default_analyze_concurrency(
+        region_backend=r.backend, species_backend=s.backend,
+    )
+
+
+_ANALYZE_SEMAPHORE = _asyncio.Semaphore(_default_analyze_concurrency())
 
 
 @app.post("/api/analyze")
 async def analyze(image: UploadFile = File(...),
                   region_hint: Optional[str] = Form(None),
+                  vessel_name: Optional[str] = Form(None),
                   company: Company = Depends(auth_svc.get_current_company)):
     content = await image.read()
     image_id, dest = storage_svc.save_upload(content, image.filename or "upload.jpg")
@@ -442,6 +475,8 @@ async def analyze(image: UploadFile = File(...),
                 original_filename=image.filename or dest.name,
                 image_id=image_id,
                 region_hint=region_hint,
+                company_id=company.id,
+                pinned_vessel_name=(vessel_name or "").strip(),
             )
     except Exception as e:
         log.exception("analyze failed")
@@ -461,6 +496,7 @@ async def analyze_video(
     video: UploadFile = File(...),
     stride_sec: float = Form(2.0),
     max_frames: int = Form(24),
+    vessel_name: Optional[str] = Form(None),
     company: Company = Depends(auth_svc.get_current_company),
 ):
     """Accept an ROV / dive video, extract sharp frames, run the 3 vision
@@ -494,6 +530,8 @@ async def analyze_video(
                 image_id=fr.image_id,
                 extra_meta={"ts_sec": fr.ts_sec, "source": "video",
                             "source_filename": fname},
+                company_id=company.id,
+                pinned_vessel_name=(vessel_name or "").strip(),
             )
         except Exception as e:
             log.warning("video frame %s failed analyze: %s", fr.image_id, e)
@@ -591,9 +629,64 @@ def image_file(image_id: str,
         row = s.get(ImageRow, image_id)
         if row is None or (row.company_id and row.company_id != company.id):
             raise HTTPException(404, "image not found")
-        if not Path(row.path).exists():
+        resolved = storage_svc.resolve_image_path(image_id, row.path)
+        if not resolved or not Path(resolved).exists():
             raise HTTPException(404, "image file missing")
-        return FileResponse(row.path)
+        return FileResponse(resolved)
+
+
+@app.get("/api/images/{image_id}/vessel-ocr")
+def image_vessel_ocr(
+    image_id: str,
+    refresh: bool = Query(False, description="Re-run OCR on disk (fixes stale best_guess)"),
+    company: Company = Depends(auth_svc.get_current_company),
+):
+    """Return ranked vessel-name OCR for a saved image (used by Photographic cover panel)."""
+    with db_session() as s:
+        row = s.get(ImageRow, image_id)
+        if row is None or (row.company_id and row.company_id != company.id):
+            raise HTTPException(404, "image not found")
+        resolved = storage_svc.resolve_image_path(image_id, row.path)
+        if not resolved or not Path(resolved).exists():
+            raise HTTPException(404, "image file missing")
+
+        stored = row.ocr_text if isinstance(row.ocr_text, list) else []
+        need_run = refresh or len(stored) < 1
+
+        if need_run:
+            try:
+                pil = PILImage.open(resolved).convert("RGB")
+                raw = ocr_inference.extract(pil)
+            except Exception as e:
+                log.exception("vessel OCR refresh failed for %s", image_id)
+                raise HTTPException(500, f"OCR failed: {e}") from e
+            stored = [
+                {"text": c["text"], "confidence": c["confidence"], "box": c.get("box")}
+                for c in raw.get("candidates", [])
+            ]
+            payload = vessel_disc.vessel_ocr_from_candidate_list(stored, image_id=image_id)
+            row.ocr_text = [{"text": c["text"], "confidence": c["confidence"]} for c in stored]
+            row.vessel_guess = payload.get("best_guess") or ""
+            s.add(row)
+        else:
+            payload = vessel_disc.vessel_ocr_from_candidate_list(stored, image_id=image_id)
+
+        fleet = vessel_reg.load_fleet_entries(s, company.id)
+        pinned = ""
+        if row.report_id:
+            rep = s.get(Report, row.report_id)
+            if rep and rep.company_id == company.id:
+                pinned = (rep.vessel_name or "").strip()
+        _resolved, payload = vessel_reg.resolve_ocr_payload_for_company(
+            payload,
+            fleet,
+            pinned_name=pinned,
+        )
+        if _resolved.display_name:
+            row.vessel_guess = _resolved.display_name
+            s.add(row)
+
+    return payload
 
 
 @app.delete("/api/images/{image_id}")
@@ -649,21 +742,72 @@ def create_report(payload: ReportCreate,
             rep.region_inspections = {
                 k: v.model_dump() for k, v in payload.region_inspections.items()
             }
-        if payload.vessel_image_id:
-            rep.vessel_image_id = payload.vessel_image_id
+        cover_id = (payload.vessel_image_id or "").strip() or None
+        if cover_id:
+            rep.vessel_image_id = cover_id
+            if not (rep.vessel_name or "").strip():
+                cover_row_early = s.get(ImageRow, cover_id)
+                if cover_row_early and (cover_row_early.vessel_guess or "").strip():
+                    rep.vessel_name = cover_row_early.vessel_guess.strip()
         s.add(rep); s.flush()
-        if payload.image_ids:
+        if cover_id:
+            cover = s.get(ImageRow, cover_id)
+            if cover is not None and cover.company_id == company.id:
+                cover.report_id = rep.id
+        attached: list[ImageRow] = []
+        image_ids = list(dict.fromkeys(list(payload.image_ids or []) + ([cover_id] if cover_id else [])))
+        if image_ids:
             rows = s.query(ImageRow).filter(
-                ImageRow.id.in_(payload.image_ids),
+                ImageRow.id.in_(image_ids),
                 ImageRow.company_id == company.id,
             ).all()
             for r in rows:
                 r.report_id = rep.id
                 r.company_id = company.id
+            attached = rows
             roll = cluster_svc.report_rollup(rows)
             rep.avg_fouling = roll["avg_fouling"]
             rep.severity    = roll["severity"]
-        return _row_to_report(rep, image_count=len(payload.image_ids))
+        # Photographic Report cover = same image as best OCR on a model-cover shot.
+        cover_pool = list(attached)
+        if cover_id:
+            hint = s.get(ImageRow, cover_id)
+            if hint is not None and hint not in cover_pool:
+                cover_pool.append(hint)
+        vessel_nm = (rep.vessel_name or payload.vessel.vesselName or "").strip()
+        auto_cover_id = cover_id
+        if attached:
+            fleet = vessel_reg.load_fleet_entries(s, company.id)
+            auto = vessel_auto_svc.auto_discover_from_images(
+                attached, fleet, pinned_name=vessel_nm,
+            )
+            if auto.display_name and not vessel_nm:
+                vessel_nm = auto.display_name
+                rep.vessel_name = auto.display_name
+                log.info(
+                    "report %s · auto vessel OCR: %s (kind=%s, nameplates=%d)",
+                    rep.id, vessel_nm, auto.match_kind, auto.nameplate_count,
+                )
+            if auto.cover_image_id:
+                auto_cover_id = auto.cover_image_id
+            if auto.needs_review:
+                extra = dict(rep.extra or {})
+                extra["vessel_auto_review"] = {
+                    "reason": auto.review_reason,
+                    "candidates": auto.candidates,
+                }
+                rep.extra = extra
+        cover_row = vessel_disc.pick_photographic_cover_image(
+            cover_pool,
+            preferred_id=auto_cover_id or cover_id or rep.vessel_image_id or None,
+            vessel_name=vessel_nm or None,
+        )
+        if cover_row is not None:
+            rep.vessel_image_id = cover_row.id
+            cover_row.report_id = rep.id
+            if not (rep.vessel_name or "").strip() and (cover_row.vessel_guess or "").strip():
+                rep.vessel_name = cover_row.vessel_guess.strip()
+        return _row_to_report(rep, image_count=len(image_ids))
 
 
 @app.get("/api/reports", response_model=List[ReportRow])
@@ -777,46 +921,60 @@ def generate_report_pdf(report_id: str,
         clusters = cluster_svc.cluster_images(rep.images)
         out = storage_svc.report_pdf_path(rep.id)
 
-        # ---- Cover photo for the "PHOTOGRAPHIC REPORT" opener page --------
-        # The wizard sets `rep.vessel_image_id` when the user uploads via
-        # the OCR card or when a raw upload is auto-detected as a whole-
-        # ship overview. If neither happened we still want the opener to
-        # have a photo, so we fall back to (in order):
-        #   1. any image already tagged `region == "vessel_cover"`
-        #   2. any image whose OCR found a vessel name
-        #   3. the first image attached to the report
-        # The chosen id is persisted back onto the report so subsequent
-        # views and re-generations stay consistent.
-        vessel_image_path = None
-        vi: Optional[ImageRow] = None
+        # ---- Photographic Report cover (wizard id + OCR name match) ----
+        cover_candidates = list(rep.images)
         if rep.vessel_image_id:
-            vi = s.get(ImageRow, rep.vessel_image_id)
-        if vi is None or not Path(vi.path).exists():
-            vi = None
-            for candidate in rep.images:
-                if candidate.region == "vessel_cover" and Path(candidate.path).exists():
-                    vi = candidate
-                    break
-            if vi is None:
-                for candidate in rep.images:
-                    if (candidate.vessel_guess or "").strip() and Path(candidate.path).exists():
-                        vi = candidate
-                        break
-            if vi is None:
-                for candidate in rep.images:
-                    if Path(candidate.path).exists():
-                        vi = candidate
-                        break
-            if vi is not None:
-                rep.vessel_image_id = vi.id
-                log.info("report %s: auto-picked cover photo %s (region=%s)",
-                         rep.id, vi.id, vi.region)
-        if vi is not None and Path(vi.path).exists():
+            hint = s.get(ImageRow, rep.vessel_image_id)
+            if hint is not None and hint.id not in {i.id for i in cover_candidates}:
+                if not hint.company_id or hint.company_id == company.id:
+                    cover_candidates.append(hint)
+        vessel_nm = (rep.vessel_name or "").strip()
+        ocr_pool: list[ImageRow] = []
+        if vessel_nm:
+            ocr_pool = s.query(ImageRow).filter(
+                ImageRow.company_id == company.id,
+                ImageRow.vessel_guess != "",
+            ).all()
+            ocr_pool = [
+                i for i in ocr_pool
+                if vessel_disc.names_match(i.vessel_guess or "", vessel_nm)
+                and storage_svc.resolve_image_path(i.id, i.path)
+            ]
+        by_id = {i.id: i for i in cover_candidates}
+        for i in ocr_pool:
+            by_id.setdefault(i.id, i)
+        vi = vessel_auto_svc.ensure_cover_image_with_ocr(
+            list(by_id.values()),
+            vessel_name=vessel_nm or "",
+            preferred_id=rep.vessel_image_id or None,
+        )
+        if vi is None and rep.vessel_image_id:
+            hint = s.get(ImageRow, rep.vessel_image_id)
+            if hint is not None and storage_svc.resolve_image_path(hint.id, hint.path):
+                vi = hint
+                log.info("report %s: photographic cover fallback to vessel_image_id %s", rep.id, hint.id)
+        if vi is None:
+            log.warning(
+                "report %s: no photographic cover image (vessel_image_id=%r, images=%d, name=%r)",
+                rep.id, rep.vessel_image_id, len(rep.images), vessel_nm,
+            )
+        vessel_image_path = None
+        if vi is not None:
+            rep.vessel_image_id = vi.id
+            vi.path = str(storage_svc.resolve_image_path(vi.id, vi.path) or vi.path)
             vessel_image_path = vi.path
+            log.info(
+                "report %s: photographic cover %s (region=%s stage=%s ocr=%.2f guess=%r)",
+                rep.id, vi.id, vi.region, vi.stage,
+                vessel_disc.ocr_confidence_from_row(vi), vi.vessel_guess,
+            )
+            if not (rep.vessel_name or "").strip() and (vi.vessel_guess or "").strip():
+                rep.vessel_name = vi.vessel_guess.strip()
 
         # Branding comes from the report's company
         c = s.get(Company, rep.company_id) or company
         settings_dict = {
+            "vessel_image_path":      vessel_image_path,
             "company_name":           c.name,
             "company_tagline":        c.tagline,
             "company_address":        c.address,
@@ -836,21 +994,43 @@ def generate_report_pdf(report_id: str,
         }
 
         try:
-            pdf_svc.build_pdf(
+            import time as _time
+            t0 = _time.perf_counter()
+            build_pdf = (
+                pdf_report_uw.build_pdf
+                if app_config.REPORT_TEMPLATE in ("uw", "birch", "client", "synergy")
+                else pdf_report_marine.build_pdf
+            )
+            vessel_dict = _db_to_vessel(rep).model_dump()
+            source_pdf = os.environ.get("NAUTICAI_SOURCE_PDF", "").strip() or None
+            log.info(
+                "report %s: PDF build start (images=%d, fast=%s, cap_per_stage=%s)",
+                rep.id, len(rep.images), app_config.PDF_FAST,
+                app_config.PDF_MAX_PHOTOS_PER_STAGE,
+            )
+            build_pdf(
                 out,
-                vessel=_db_to_vessel(rep).model_dump(),
+                vessel=vessel_dict,
                 clusters=clusters,
                 region_inspections=rep.region_inspections or {},
                 vessel_image_path=vessel_image_path,
+                source_pdf_path=source_pdf,
                 settings=settings_dict,
                 report_id=rep.id,
                 created_at=rep.created_at,
             )
+            log.info(
+                "report %s: PDF built in %.1fs → %s",
+                rep.id, _time.perf_counter() - t0, out,
+            )
         except Exception as e:
             log.exception("pdf build failed")
             raise HTTPException(500, f"PDF build failed: {e}")
-        rep.pdf_path = str(out)
+        if not out.exists() or out.stat().st_size < 100:
+            raise HTTPException(500, f"PDF file missing or empty after build: {out}")
+        rep.pdf_path = str(out.resolve())
         rep.status = "completed" if rep.images else "draft"
+        s.flush()
         return {"ok": True, "pdf_url": f"/api/reports/{rep.id}/pdf"}
 
 
@@ -1016,6 +1196,164 @@ def delete_client(client_id: str,
             raise HTTPException(404, "client not found")
         s.delete(cl)
         return {"ok": True}
+
+
+# =============================================================================
+# VESSELS  (company fleet directory — OCR resolution)
+# =============================================================================
+def _vessel_to_row(v: Vessel) -> VesselRow:
+    aliases = v.aliases if isinstance(v.aliases, list) else []
+    return VesselRow(
+        id=v.id,
+        name=v.name,
+        aliases=aliases,
+        imo_number=v.imo_number or "",
+        notes=v.notes or "",
+        created_at=v.created_at,
+        updated_at=v.updated_at,
+    )
+
+
+@app.get("/api/vessels", response_model=List[VesselRow])
+def list_vessels(q: Optional[str] = None,
+                 limit: int = Query(200, le=500),
+                 company: Company = Depends(auth_svc.get_current_company)):
+    with db_session() as s:
+        query = s.query(Vessel).filter(Vessel.company_id == company.id) \
+                               .order_by(Vessel.name.asc())
+        if q:
+            ql = f"%{q.lower()}%"
+            query = query.filter(Vessel.name.ilike(ql))
+        return [_vessel_to_row(v) for v in query.limit(limit).all()]
+
+
+@app.post("/api/vessels", response_model=VesselRow)
+def create_vessel(payload: VesselCreate,
+                  company: Company = Depends(auth_svc.get_current_company)):
+    with db_session() as s:
+        aliases = [a.strip() for a in (payload.aliases or []) if str(a).strip()]
+        v = Vessel(
+            company_id=company.id,
+            name=payload.name.strip(),
+            aliases=aliases,
+            imo_number=(payload.imo_number or "").strip(),
+            notes=payload.notes or "",
+        )
+        s.add(v)
+        s.flush()
+        return _vessel_to_row(v)
+
+
+@app.get("/api/vessels/{vessel_id}", response_model=VesselRow)
+def get_vessel(vessel_id: str,
+               company: Company = Depends(auth_svc.get_current_company)):
+    with db_session() as s:
+        v = s.get(Vessel, vessel_id)
+        if v is None or v.company_id != company.id:
+            raise HTTPException(404, "vessel not found")
+        return _vessel_to_row(v)
+
+
+@app.put("/api/vessels/{vessel_id}", response_model=VesselRow)
+def update_vessel(vessel_id: str, payload: VesselCreate,
+                  company: Company = Depends(auth_svc.get_current_company)):
+    with db_session() as s:
+        v = s.get(Vessel, vessel_id)
+        if v is None or v.company_id != company.id:
+            raise HTTPException(404, "vessel not found")
+        v.name = payload.name.strip()
+        v.aliases = [a.strip() for a in (payload.aliases or []) if str(a).strip()]
+        v.imo_number = (payload.imo_number or "").strip()
+        v.notes = payload.notes or ""
+        s.flush()
+        return _vessel_to_row(v)
+
+
+@app.delete("/api/vessels/{vessel_id}")
+def delete_vessel(vessel_id: str,
+                  company: Company = Depends(auth_svc.get_current_company)):
+    with db_session() as s:
+        v = s.get(Vessel, vessel_id)
+        if v is None or v.company_id != company.id:
+            raise HTTPException(404, "vessel not found")
+        s.delete(v)
+        return {"ok": True}
+
+
+def _auto_detect_from_image_ids(
+    s,
+    image_ids: list[str],
+    company_id: str,
+    *,
+    pinned_vessel_name: str = "",
+) -> vessel_auto_svc.AutoVesselBatchResult:
+    rows: list[ImageRow] = []
+    if image_ids:
+        rows = s.query(ImageRow).filter(
+            ImageRow.id.in_(image_ids),
+            ImageRow.company_id == company_id,
+        ).all()
+    fleet = vessel_reg.load_fleet_entries(s, company_id)
+    return vessel_auto_svc.auto_discover_from_images(
+        rows, fleet, pinned_name=(pinned_vessel_name or "").strip(),
+    )
+
+
+@app.post("/api/vessels/auto-detect", response_model=VesselSuggestResponse)
+def auto_detect_vessel(
+    payload: VesselSuggestRequest,
+    company: Company = Depends(auth_svc.get_current_company),
+):
+    """Fully automated vessel name + cover photo from analysed raw images (no manual fleet)."""
+    with db_session() as s:
+        auto = _auto_detect_from_image_ids(
+            s, payload.image_ids, company.id,
+            pinned_vessel_name=payload.pinned_vessel_name,
+        )
+        alts = vessel_auto_svc.list_cover_alternates(rows, fleet)
+        return VesselSuggestResponse(
+            display_name=auto.display_name,
+            match_kind=auto.match_kind,
+            confidence=auto.confidence,
+            score=auto.score,
+            raw_ocr=auto.raw_ocr,
+            registry_id=auto.registry_id,
+            needs_review=auto.needs_review,
+            review_reason=auto.review_reason or "",
+            cover_image_id=auto.cover_image_id,
+            cover_alternates=[CoverAlternateRow(**a) for a in alts],
+        )
+
+
+@app.post("/api/vessels/cover-alternates", response_model=CoverAlternatesResponse)
+def list_cover_alternates(
+    payload: VesselSuggestRequest,
+    refresh: bool = Query(False, description="Re-run OCR on every nameplate photo"),
+    company: Company = Depends(auth_svc.get_current_company),
+):
+    """Ranked list of nameplate photos + OCR names (cycle when one angle mis-reads)."""
+    with db_session() as s:
+        rows: list[ImageRow] = []
+        if payload.image_ids:
+            rows = s.query(ImageRow).filter(
+                ImageRow.id.in_(payload.image_ids),
+                ImageRow.company_id == company.id,
+            ).all()
+        fleet = vessel_reg.load_fleet_entries(s, company.id)
+        alts = vessel_auto_svc.list_cover_alternates(
+            rows, fleet, refresh_ocr=refresh,
+        )
+        return CoverAlternatesResponse(
+            cover_alternates=[CoverAlternateRow(**a) for a in alts],
+            total=len(alts),
+        )
+
+
+@app.post("/api/vessels/suggest", response_model=VesselSuggestResponse)
+def suggest_vessel(payload: VesselSuggestRequest,
+                   company: Company = Depends(auth_svc.get_current_company)):
+    """Alias for auto-detect (backward compatible)."""
+    return auto_detect_vessel(payload, company)
 
 
 # =============================================================================
