@@ -15,13 +15,14 @@ import ClientPicker from '../components/ClientPicker'
 import { useReport, emptyFindings } from '../store/reportStore'
 import { HULL_REGIONS, VESSEL_TYPES, VESSEL_CLASSES } from '../lib/constants'
 import {
-  analyzeImage, analyzeVideo, isVideoFile, fetchImageObjectUrl,
+  analyzeImage, analyzeVideo, isVideoFile, fetchImageObjectUrl, uploadErrorMessage,
   createReport, generateReportPdf, openReportPdf, ocrVessel, checkBackendOnline, friendlyApiDetail,
 } from '../lib/api'
 import {
   applyVesselOcrToReport,
   isCoverOnlyResult,
 } from '../lib/vesselCover'
+import { uid } from '../lib/uid'
 
 const STEPS = [
   { id: 'images',    title: 'Upload Raw Data' },
@@ -655,7 +656,7 @@ function ImagesStep() {
     trackOcrPriority(files)
     files.forEach(trackForOcrSweep)
     const next = files.map((file) => ({
-      id: crypto.randomUUID(),
+      id: uid(),
       file,
       url: URL.createObjectURL(file),
       name: file.name,
@@ -739,9 +740,9 @@ function ImagesStep() {
       setStaging((p) => p.filter((x) => x.id !== id))  // success → remove from staging
       setBatchDone((n) => n + 1)
     } catch (err) {
-      const msg = err?.response?.data?.detail || err?.message || 'Analysis failed'
+      const msg = uploadErrorMessage(err)
       setStaging((p) => p.map((x) => x.id === id ? { ...x, status: 'error', error: msg } : x))
-      toast.error(`${it.name}: ${msg}`)
+      toast.error(`${it.name}: ${msg}`, { duration: 8000 })
     } finally {
       // Free the slot so the auto-dispatch effect can pull the next pending.
       inFlightRef.current.delete(id)

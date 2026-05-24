@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { uid } from '../lib/uid'
 import { autoDetectVessel, fetchCoverAlternates, fetchImageVesselOcr, friendlyApiDetail } from '../lib/api'
 import {
   applyVesselOcrToReport,
@@ -499,7 +500,7 @@ export const useReport = create((set, get) => ({
 
   addImages: (regionId, files) => {
     const incoming = files.map((file) => ({
-      id: crypto.randomUUID(),
+      id: uid(),
       file,
       url: URL.createObjectURL(file),
       name: file.name,
@@ -523,7 +524,7 @@ export const useReport = create((set, get) => ({
       return
     }
     const item = {
-      id: entry.id || crypto.randomUUID(),
+      id: entry.id || uid(),
       file: entry.file || null,
       url: entry.url,
       name: entry.name,

@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
   Sparkles, Loader2, Trash2, ScanSearch, ImagePlus, Video,
@@ -7,10 +7,13 @@ import {
 import toast from 'react-hot-toast'
 import ImageDropzone from '../components/ImageDropzone'
 import { HULL_REGIONS } from '../lib/constants'
-import { analyzeImage, analyzeVideo, isVideoFile, fetchImageObjectUrl } from '../lib/api'
+import {
+  analyzeImage, analyzeVideo, isVideoFile, fetchImageObjectUrl,
+  isMixedContentBlocked, uploadErrorMessage,
+} from '../lib/api'
+import { useAuth } from '../store/authStore'
 import { isCoverOnlyResult, ocrCandidateScore, pickBestVesselOcr } from '../lib/vesselCover'
-
-const uid = () => crypto.randomUUID()
+import { uid } from '../lib/uid'
 
 /**
  * Image / Video / Folder studio.
@@ -22,6 +25,9 @@ const uid = () => crypto.randomUUID()
  */
 export default function UploadImages() {
   const [items, setItems] = useState([])
+  const itemsRef = useRef(items)
+  itemsRef.current = items
+  const token = useAuth((s) => s.token)
   const [busy, setBusy] = useState(false)
   const [vesselCover, setVesselCover] = useState(null) // { name, imageId, url, fileName }
 
@@ -47,8 +53,12 @@ export default function UploadImages() {
 
   // -------- analysis dispatch ------------------------------------------
   const analyzeOne = async (id) => {
-    const it = items.find((i) => i.id === id)
+    const it = itemsRef.current.find((i) => i.id === id)
     if (!it || it.status === 'analyzing') return
+    if (!it.file) {
+      toast.error(`${it.name}: file missing — re-add from folder or Browse Files`)
+      return
+    }
 
     setItems((p) => p.map((i) => i.id === id ? { ...i, status: 'analyzing', progress: 0, error: null } : i))
 
@@ -129,18 +139,30 @@ export default function UploadImages() {
         }
       }
     } catch (err) {
-      const msg = err?.response?.data?.detail || err?.message || 'Analysis failed'
+      const msg = uploadErrorMessage(err)
       setItems((p) => p.map((i) =>
         i.id === id ? { ...i, status: 'error', error: msg } : i,
       ))
-      toast.error(`${it.name}: ${msg}`)
+      toast.error(`${it.name}: ${msg}`, { duration: 8000 })
     }
   }
 
   const analyzeAll = async () => {
+    if (isMixedContentBlocked()) {
+      toast.error(uploadErrorMessage({}), { duration: 10000 })
+      return
+    }
+    if (!token) {
+      toast.error('Log in on this site URL first — uploads are sent to the cloud API with your account token')
+      return
+    }
+    const pending = itemsRef.current.filter((i) => i.status === 'pending' || i.status === 'error')
+    if (!pending.length) {
+      toast('Nothing to analyse — add images or videos first')
+      return
+    }
     setBusy(true)
     try {
-      const pending = items.filter((i) => i.status === 'pending' || i.status === 'error')
       // Process videos sequentially (heavy), images can run in parallel.
       const videos = pending.filter((i) => i.kind === 'video')
       const images = pending.filter((i) => i.kind === 'image')
