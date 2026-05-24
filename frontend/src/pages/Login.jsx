@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import { Mail, Lock, Loader2, ArrowRight, Anchor } from 'lucide-react'
 import toast from 'react-hot-toast'
-import { login } from '../lib/api'
+import { login, uploadErrorMessage } from '../lib/api'
 import { useAuth } from '../store/authStore'
 import { useBrand } from '../store/brandStore'
 import AuthLayout from '../components/AuthLayout'
@@ -28,7 +28,7 @@ export default function Login() {
       toast.success(`Welcome back, ${r.user.full_name || r.user.email}`)
       // AuthGate validates the session and switches to the main app (no manual nav).
     } catch (err) {
-      toast.error(err?.response?.data?.detail || 'Sign in failed')
+      toast.error(uploadErrorMessage(err) || 'Sign in failed', { duration: 8000 })
     } finally { setBusy(false) }
   }
 

@@ -277,6 +277,23 @@ def _company_logo_dest(company_id: str, suffix: str) -> Path:
 # =============================================================================
 # Health / Meta
 # =============================================================================
+@app.post("/api/diagnostics/upload-echo")
+async def upload_echo(
+    image: UploadFile = File(...),
+    company: Company = Depends(auth_svc.get_current_company),
+):
+    """Lightweight multipart check — same auth + upload path as /api/analyze, no ML."""
+    content = await image.read()
+    if not content:
+        raise HTTPException(400, "empty upload")
+    return {
+        "ok": True,
+        "bytes": len(content),
+        "filename": image.filename or "upload",
+        "company_id": company.id,
+    }
+
+
 @app.get("/api/health")
 def health():
     return {"ok": True, "ts": datetime.utcnow().isoformat(),

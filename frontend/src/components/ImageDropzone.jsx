@@ -1,6 +1,7 @@
 import { useRef } from 'react'
 import { useDropzone } from 'react-dropzone'
 import { UploadCloud, ImagePlus, FolderPlus, Video } from 'lucide-react'
+import toast from 'react-hot-toast'
 import clsx from 'clsx'
 import { isImageFile, isVideoFile, IMAGE_EXTS, VIDEO_EXTS } from '../lib/api'
 
@@ -36,7 +37,11 @@ export default function ImageDropzone({
   const { getRootProps, getInputProps, isDragActive, open } = useDropzone({
     onDrop: (accepted) => {
       const files = filterFiles(accepted)
-      if (files.length) onFiles(files)
+      if (files.length) {
+        onFiles(files)
+      } else if (accepted.length) {
+        toast.error('Dropped files are not supported images or videos')
+      }
     },
     accept,
     multiple,
@@ -49,7 +54,16 @@ export default function ImageDropzone({
   const onFolderChange = (e) => {
     const files = Array.from(e.target.files || [])
     const filtered = filterFiles(files)
-    if (filtered.length) onFiles(filtered)
+    if (!filtered.length) {
+      toast.error(
+        files.length
+          ? 'No JPG/PNG/WEBP images or supported videos in that folder'
+          : 'Folder is empty or could not be read — try Browse Files instead',
+      )
+    } else {
+      toast.success(`Added ${filtered.length} file${filtered.length === 1 ? '' : 's'} from folder`)
+      onFiles(filtered)
+    }
     e.target.value = ''
   }
 

@@ -9,6 +9,8 @@ import clsx from 'clsx'
 import toast from 'react-hot-toast'
 import {
   getSettings, saveSettings, uploadLogo, deleteLogo,
+  checkBackendOnline, getBuildApiRoot, getConfiguredApiRoot, getApiRootOverride,
+  setApiRootOverride, isMixedContentBlocked, testUploadEcho, uploadErrorMessage,
 } from '../lib/api'
 import { useBrand } from '../store/brandStore'
 
@@ -41,6 +43,8 @@ export default function Settings() {
   const [form, setForm] = useState(brand.data)
   const [saving, setSaving] = useState(false)
   const [uploading, setUploading] = useState(false)
+  const [apiDraft, setApiDraft] = useState(() => getConfiguredApiRoot())
+  const [apiTesting, setApiTesting] = useState(false)
 
   useEffect(() => {
     (async () => {
@@ -213,6 +217,90 @@ export default function Settings() {
           </SettingsBlock>
         </div>
       </section>
+
+      {(getBuildApiRoot() || getApiRootOverride()) && (
+        <section className="glass rounded-2xl p-5 space-y-4">
+          <div className="flex items-center gap-2">
+            <Activity size={16} className="text-brand-300" />
+            <h3 className="font-display font-semibold text-white">API connection (deployed UI)</h3>
+          </div>
+          <p className="text-sm text-slate-400">
+            Local <code className="text-slate-300">npm run dev</code> proxies to your PC backend.
+            The S3 / CloudFront build talks to GCP directly — if uploads work on your PC but not on
+            another machine, fix the URL here or use the HTTP (not HTTPS) website URL.
+          </p>
+          {isMixedContentBlocked() && (
+            <p className="rounded-lg bg-rose-500/15 border border-rose-500/30 px-3 py-2 text-sm text-rose-100">
+              This page is HTTPS but the API is HTTP — uploads are blocked until you switch to an HTTP UI URL
+              or an HTTPS API.
+            </p>
+          )}
+          <label className="block">
+            <span className="label">API base URL (no trailing slash)</span>
+            <input
+              className="input font-mono text-sm"
+              value={apiDraft}
+              onChange={(e) => setApiDraft(e.target.value)}
+              placeholder={getBuildApiRoot() || 'http://YOUR_VM_IP:8000'}
+            />
+          </label>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              className="btn-outline"
+              onClick={() => {
+                setApiRootOverride(apiDraft)
+                setApiDraft(getConfiguredApiRoot())
+                toast.success('API URL saved in this browser')
+              }}
+            >
+              Save API URL
+            </button>
+            <button
+              type="button"
+              className="btn-ghost"
+              onClick={() => {
+                setApiRootOverride('')
+                setApiDraft(getBuildApiRoot())
+                toast.success('Using built-in API from deploy build')
+              }}
+            >
+              Reset to build default
+            </button>
+            <button
+              type="button"
+              className="btn-primary"
+              disabled={apiTesting}
+              onClick={async () => {
+                setApiTesting(true)
+                try {
+                  setApiRootOverride(apiDraft)
+                  const ok = await checkBackendOnline()
+                  if (!ok) {
+                    toast.error(`Health check failed for ${getConfiguredApiRoot()}`)
+                    return
+                  }
+                  const blob = new Blob([new Uint8Array([0xff, 0xd8, 0xff])], { type: 'image/jpeg' })
+                  const f = new File([blob], 'ping.jpg', { type: 'image/jpeg' })
+                  const r = await testUploadEcho(f)
+                  toast.success(`API OK · upload echo ${r.bytes} bytes`)
+                } catch (e) {
+                  toast.error(uploadErrorMessage(e), { duration: 9000 })
+                } finally {
+                  setApiTesting(false)
+                }
+              }}
+            >
+              {apiTesting ? <Loader2 size={14} className="animate-spin" /> : <Activity size={14} />}
+              Test health + upload
+            </button>
+          </div>
+          <p className="text-[11px] text-slate-500">
+            Active: <code className="text-slate-400">{getConfiguredApiRoot() || '(Vite /api proxy)'}</code>
+            {getBuildApiRoot() && ` · Built with ${getBuildApiRoot()}`}
+          </p>
+        </section>
+      )}
 
       {/* AI capabilities panel — client-friendly language only */}
       <section className="glass rounded-2xl p-5">

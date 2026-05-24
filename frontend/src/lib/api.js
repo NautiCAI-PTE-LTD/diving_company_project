@@ -1,18 +1,110 @@
-// Real API client. Talks to FastAPI backend at /api/* (proxied by Vite to :8000).
+// Real API client. Dev: /api (Vite proxy → :8000). Production (S3/CloudFront): set VITE_API_URL.
 import axios from 'axios'
 import { useAuth } from '../store/authStore'
 
+const API_ROOT_STORAGE = 'nauticai_api_root'
+
+/** Built-in production API (from `npm run build`) or empty in local dev. */
+export function getBuildApiRoot() {
+  return (import.meta.env.VITE_API_URL || '').trim().replace(/\/$/, '')
+}
+
+/** Runtime override (Settings) — survives S3 redeploys when the VM IP changes. */
+export function getApiRootOverride() {
+  try {
+    return (localStorage.getItem(API_ROOT_STORAGE) || '').trim().replace(/\/$/, '')
+  } catch {
+    return ''
+  }
+}
+
+export function setApiRootOverride(url) {
+  const v = (url || '').trim().replace(/\/$/, '')
+  try {
+    if (!v) localStorage.removeItem(API_ROOT_STORAGE)
+    else localStorage.setItem(API_ROOT_STORAGE, v)
+  } catch { /* private browsing */ }
+}
+
+/** S3 deploy: `public/runtime-config.js` sets window.__NAUTICAI_API_URL__ before the app loads. */
+export function getRuntimeApiRoot() {
+  if (typeof window === 'undefined') return ''
+  const v = window.__NAUTICAI_API_URL__
+  return (v == null ? '' : String(v)).trim().replace(/\/$/, '')
+}
+
+/** Public API origin without `/api`, e.g. `http://34.87.86.250:8000` or `''` in dev. */
+export function getConfiguredApiRoot() {
+  return getApiRootOverride() || getRuntimeApiRoot() || getBuildApiRoot()
+}
+
+export function isProductionDeploy() {
+  return Boolean(getConfiguredApiRoot())
+}
+
+/** @returns {string} e.g. '/api' or 'http://34.87.86.250:8000/api' */
+export function resolveApiBaseURL() {
+  const raw = getConfiguredApiRoot()
+  if (!raw) return '/api'
+  return raw.endsWith('/api') ? raw : `${raw}/api`
+}
+
+/** HTTPS UI cannot call an HTTP API — uploads fail with generic "Network Error". */
+export function isMixedContentBlocked() {
+  if (typeof window === 'undefined') return false
+  if (window.location.protocol !== 'https:') return false
+  const root = getConfiguredApiRoot().toLowerCase()
+  return root.startsWith('http://')
+}
+
 export const api = axios.create({
-  baseURL: '/api',
+  baseURL: resolveApiBaseURL(),
   timeout: 120_000,
 })
+
+/** Let the browser set multipart boundary — never force Content-Type on FormData. */
+const formPost = (url, formData, config = {}) => {
+  const headers = { ...(config.headers || {}) }
+  delete headers['Content-Type']
+  delete headers['content-type']
+  return api.post(url, formData, { ...config, headers })
+}
+
+/** Sync message for upload/analyze failures (used in toasts). */
+export function uploadErrorMessage(err) {
+  if (isMixedContentBlocked() && !err?.response) {
+    return (
+      'Browser blocked the HTTP API from this HTTPS site. Open the UI via the S3 HTTP website URL, '
+      + 'or set an HTTPS API URL under Settings → API connection.'
+    )
+  }
+  const raw = err?.response?.data
+  if (!raw) {
+    const msg = err?.message || ''
+    if (/network|failed to fetch|ECONNREFUSED|ERR_CONNECTION|ERR_BLOCKED/i.test(msg)) {
+      const hint = getConfiguredApiRoot() || 'http://127.0.0.1:8000 (local dev uses /api proxy)'
+      return `Cannot reach the API at ${hint} — VM running, port 8000 open, and logged in on this URL?`
+    }
+    return msg || String(err)
+  }
+  if (typeof raw === 'string') return raw
+  if (raw?.detail) {
+    const d = raw.detail
+    return typeof d === 'string' ? d : JSON.stringify(d)
+  }
+  return err?.message || 'Upload failed'
+}
 
 /** Turn API errors into a short message (handles blob 404 bodies from PDF routes). */
 export async function apiErrorMessage(err) {
   const raw = err?.response?.data
   if (!raw) {
-    if (/network|ECONNREFUSED|ERR_CONNECTION/i.test(err?.message || '')) {
-      return 'Cannot reach the API — start the backend on http://127.0.0.1:8000'
+    if (isMixedContentBlocked()) {
+      return uploadErrorMessage(err)
+    }
+    if (/network|ECONNREFUSED|ERR_CONNECTION|failed to fetch/i.test(err?.message || '')) {
+      const hint = getConfiguredApiRoot() || 'http://127.0.0.1:8000'
+      return `Cannot reach the API at ${hint}`
     }
     return err?.message || String(err)
   }
@@ -47,7 +139,8 @@ export async function checkBackendOnline() {
 export function friendlyApiDetail(detail, fallback = 'Request failed') {
   const d = (detail || '').trim()
   if (!d || d === 'Not Found') {
-    return 'API not reachable — start backend: python -m uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000'
+    const hint = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000'
+    return `API not reachable — check backend at ${hint}`
   }
   if (d === 'image not found' || d === 'image file missing') {
     return 'Photo not on server — re-upload on Upload Raw Data and wait until analysis finishes'
@@ -55,8 +148,9 @@ export function friendlyApiDetail(detail, fallback = 'Request failed') {
   return d
 }
 
-// Attach Bearer token to every outgoing request.
+// Attach Bearer token; refresh baseURL when API override changes.
 api.interceptors.request.use((cfg) => {
+  cfg.baseURL = resolveApiBaseURL()
   const token = useAuth.getState().token
   if (token) cfg.headers.Authorization = `Bearer ${token}`
   return cfg
@@ -143,8 +237,7 @@ export async function analyzeImage(file, { regionHint } = {}) {
   const fd = new FormData()
   fd.append('image', file)
   if (regionHint) fd.append('region_hint', regionHint)
-  const { data } = await api.post('/analyze', fd, {
-    headers: { 'Content-Type': 'multipart/form-data' },
+  const { data } = await formPost('/analyze', fd, {
     // 10 min ceiling per request. The UI caps concurrency at 4, so the
     // worst-case wait per request is (4 × per-image model time + a bit
     // of OCR on overview shots). On CPU-only deploys a single analyze
@@ -160,8 +253,7 @@ export async function analyzeVideo(file, { strideSec = 2.0, maxFrames = 24, onPr
   fd.append('video', file)
   fd.append('stride_sec', String(strideSec))
   fd.append('max_frames', String(maxFrames))
-  const { data } = await api.post('/analyze/video', fd, {
-    headers: { 'Content-Type': 'multipart/form-data' },
+  const { data } = await formPost('/analyze/video', fd, {
     timeout: 600_000,  // up to 10 minutes for long ROV footage
     onUploadProgress: (evt) => {
       if (onProgress && evt.total) onProgress(evt.loaded / evt.total)
@@ -173,8 +265,7 @@ export async function analyzeVideo(file, { strideSec = 2.0, maxFrames = 24, onPr
 export async function ocrVessel(file, { persist = false } = {}) {
   const fd = new FormData()
   fd.append('image', file)
-  const { data } = await api.post('/ocr/vessel', fd, {
-    headers: { 'Content-Type': 'multipart/form-data' },
+  const { data } = await formPost('/ocr/vessel', fd, {
     params: persist ? { persist: true } : undefined,
   })
   return data    // { candidates: [{text,confidence,box}], best_guess, best_confidence, image_id?, url? }
@@ -309,9 +400,15 @@ export async function saveSettings(payload) {
 export async function uploadLogo(file) {
   const fd = new FormData()
   fd.append('image', file)
-  const { data } = await api.post('/settings/logo', fd, {
-    headers: { 'Content-Type': 'multipart/form-data' },
-  })
+  const { data } = await formPost('/settings/logo', fd)
+  return data
+}
+
+/** Small multipart POST to verify browser → API uploads (auth required). */
+export async function testUploadEcho(file) {
+  const fd = new FormData()
+  fd.append('image', file)
+  const { data } = await formPost('/diagnostics/upload-echo', fd, { timeout: 60_000 })
   return data
 }
 
