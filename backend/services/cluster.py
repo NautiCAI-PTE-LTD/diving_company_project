@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Dict, List
 from .. import config
+from . import narrative as narrative_svc
 
 
 # Pseudo-region tags that mean "this is NOT a hull close-up". These images
@@ -22,13 +23,12 @@ def cluster_images(images) -> Dict[str, Dict[str, List[dict]]]:
     """
     out: Dict[str, Dict[str, List[dict]]] = {}
     for img in images:
-        region = img.region or "Bow"
-        # Wide ship-overview photos never go into hull-region buckets.
-        if region in NON_HULL_REGIONS:
+        region = (img.region or "").strip()
+        if not region or region in NON_HULL_REGIONS:
             continue
-        if (img.stage or "") not in config.STAGES:
+        stage = (img.stage or "").strip()
+        if stage not in ("before", "after"):
             continue
-        stage  = img.stage
         bucket = out.setdefault(region, {"before": [], "after": [], "_meta": {
             "region_id": region,
             "region_display": config.HULL_REGION_DISPLAY.get(region, region),
@@ -64,6 +64,13 @@ def cluster_images(images) -> Dict[str, Dict[str, List[dict]]]:
             m["avg_fouling"] = round(m["avg_fouling"] / m["count"], 1)
         m["species_counts"] = dict(m["species_counts"])
         m["severities"]     = dict(m["severities"])
+        # Thickness range from per-photo AI fouling % + species (averaged), not
+        # a single region-mean % pushed through one bracket.
+        analysed = bucket["before"] + bucket["after"]
+        m["thickness_range"] = narrative_svc.thickness_range_from_analysed_images(
+            analysed,
+        )
+        m["thickness_source"] = "per_image_avg"
         # dominant severity = max severity letter present  (worst case)
         for sev in ("C", "B", "A", "D"):
             if m["severities"].get(sev):

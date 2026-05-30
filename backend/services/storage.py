@@ -69,20 +69,33 @@ def report_pdf_path(report_id: str) -> Path:
     return config.REPORTS_DIR / f"{report_id}.pdf"
 
 
+def _basename_cross_platform(path: str | Path) -> str:
+    """Filename from a path that may use Windows or POSIX separators."""
+    s = str(path).replace("\\", "/")
+    return s.rsplit("/", 1)[-1] if s else ""
+
+
 def resolve_image_path(image_id: str, stored_path: str | Path | None = None) -> Path | None:
-    """Find the on-disk file for an image row (DB path can be stale after moves)."""
+    """Find the on-disk file for an image row (DB path can be stale after moves).
+
+    Lookup order:
+    1. ``uploads/<image_id>.<ext>`` — works when DB still has a Windows path on Linux.
+    2. Stored path if it exists on this machine.
+    3. ``uploads/<basename(stored_path)>`` — handles ``F:\\...\\uuid.jpg`` on GCP.
+    """
     iid = (image_id or "").strip()
+    if iid:
+        for ext in (".jpg", ".jpeg", ".png", ".webp", ".JPG", ".JPEG"):
+            cand = config.UPLOADS_DIR / f"{iid}{ext}"
+            if cand.exists():
+                return cand
     if stored_path:
         p = Path(stored_path)
         if p.exists():
             return p
-        by_name = config.UPLOADS_DIR / p.name
-        if by_name.exists():
-            return by_name
-    if not iid:
-        return None
-    for ext in (".jpg", ".jpeg", ".png", ".webp", ".JPG", ".JPEG"):
-        cand = config.UPLOADS_DIR / f"{iid}{ext}"
-        if cand.exists():
-            return cand
+        fname = _basename_cross_platform(stored_path)
+        if fname:
+            by_name = config.UPLOADS_DIR / fname
+            if by_name.exists():
+                return by_name
     return None

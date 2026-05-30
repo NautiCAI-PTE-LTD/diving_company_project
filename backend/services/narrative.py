@@ -15,17 +15,17 @@ Methodology
    surveyors use in the template ("Slime", "barnacles", "Algae", …).
    When two species are co-dominant, the sentence reads
    *"fouled by Slime and barnacles"*.
-3. **Thickness** is **always** rendered as a millimetre **range** (e.g.
-   *"3-5mm"*) — never a single number like *"5mm"*. The range is picked
-   by mapping the AI's % area-covered estimate through a non-linear
-   bracket table, with a slightly thicker scale used for hard fouling
-   (barnacles, mussels).
+3. **Thickness** is **always** a millimetre **range** (e.g. *"2-4mm"*).
+   For each analysed photo we map that image's fouling **%** and **top
+   species** to a conservative mm band, then **average** those bands for
+   the survey location (journal-style scale — not a single region-mean %
+   pushed through one high bracket).
 4. **Severity (A/B/C/D)** and **Cleaning (Yes/No)** are derived from the
    coverage % using the same scale shown at the bottom of the source
    template:  A=Light · B=Moderate · C=Heavy · D=Clean.
 """
 from __future__ import annotations
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 
 # --------------------------------------------------------------- templates
@@ -150,38 +150,65 @@ _HARD_SPECIES = {"barnacles", "mussels", "goosenecks", "tubeworms", "calcareous"
 
 
 # --------------------------------------------------------- thickness model
-# Both tables only ever return **ranges** (e.g. "3-5mm") — never a single
-# millimetre. Picking a range communicates the uncertainty inherent in
-# inferring layer thickness from visual coverage alone.
-_BRACKETS_SOFT = [
-    # (max coverage %,  range)
-    (10,  "0-1mm"),
-    (30,  "1-3mm"),
-    (50,  "2-4mm"),
-    (70,  "3-5mm"),
-    (85,  "5-7mm"),
-    (101, "5-10mm"),
+# Per-image bands from AI fouling % (species classifier). Conservative vs
+# the old region-only table so clients do not see inflated "5-7mm" rows.
+_IMAGE_BRACKETS_SOFT: List[Tuple[float, Tuple[int, int]]] = [
+    (10,  (0, 1)),
+    (25,  (1, 2)),
+    (45,  (1, 3)),
+    (65,  (2, 4)),
+    (80,  (2, 5)),
+    (101, (3, 6)),
 ]
-_BRACKETS_HARD = [
-    (10,  "0-1mm"),
-    (30,  "1-3mm"),
-    (50,  "2-5mm"),
-    (70,  "3-6mm"),
-    (85,  "5-8mm"),
-    (101, "8-12mm"),
+_IMAGE_BRACKETS_HARD: List[Tuple[float, Tuple[int, int]]] = [
+    (10,  (0, 1)),
+    (25,  (1, 3)),
+    (45,  (2, 4)),
+    (65,  (3, 5)),
+    (80,  (4, 6)),
+    (101, (5, 8)),
 ]
+
+
+def _image_thickness_mm(pct: float, top_species: str) -> Tuple[int, int]:
+    """One photo → (lo, hi) mm from its AI fouling % and dominant species."""
+    sid = (top_species or "").strip()
+    if sid in ("clean_paint", "vessel_cover") or pct < 10:
+        return (0, 1)
+    brackets = _IMAGE_BRACKETS_HARD if sid in _HARD_SPECIES else _IMAGE_BRACKETS_SOFT
+    for limit, band in brackets:
+        if pct < limit:
+            return band
+    return brackets[-1][1]
+
+
+def _format_mm_range(lo: float, hi: float) -> str:
+    lo_i = max(0, int(round(lo)))
+    hi_i = max(lo_i + 1, int(round(hi)))
+    if hi_i - lo_i < 1:
+        hi_i = lo_i + 1
+    return f"{lo_i}-{hi_i}mm"
+
+
+def thickness_range_from_analysed_images(images: List[dict]) -> str:
+    """Average per-image thickness bands for all photos in a hull region."""
+    if not images:
+        return "0-1mm"
+    los: list[float] = []
+    his: list[float] = []
+    for im in images:
+        pct = float(im.get("fouling_pct") or 0.0)
+        top = (im.get("species_top") or "unknown").strip()
+        lo, hi = _image_thickness_mm(pct, top)
+        los.append(float(lo))
+        his.append(float(hi))
+    return _format_mm_range(sum(los) / len(los), sum(his) / len(his))
 
 
 def thickness_range(pct: float, top_species: str) -> str:
-    """Map (coverage %, dominant species) → human-readable mm range.
-
-    Always returns a range. Never a single millimetre value.
-    """
-    brackets = _BRACKETS_HARD if top_species in _HARD_SPECIES else _BRACKETS_SOFT
-    for limit, label in brackets:
-        if pct < limit:
-            return label
-    return brackets[-1][1]
+    """Fallback: single mean % + dominant species (legacy callers)."""
+    lo, hi = _image_thickness_mm(pct, top_species)
+    return _format_mm_range(lo, hi)
 
 
 def severity_letter(pct: float, top: str) -> str:
@@ -261,7 +288,9 @@ def narrative_for_location(template_id: str,
         if sec_n >= 0.25 * primary_n:
             secondary = sec
 
-    thickness = thickness_range(pct, primary)
+    thickness = (meta.get("thickness_range") or "").strip()
+    if not thickness:
+        thickness = thickness_range(pct, primary)
     species_phrase = _species_phrase(primary, secondary)
 
     tpl = LOCATION_TEMPLATES.get(
